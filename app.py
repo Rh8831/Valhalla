@@ -119,7 +119,9 @@ def mark_user_disabled(owner_id, local_username):
 
 def disable_remote(panel_url, token, remote_username):
     try:
-        url = urljoin(panel_url.rstrip("/") + "/", f"/api/users/{remote_username}/disable")
+        # panel_url may already include a path component; urljoin with a leading
+        # slash would discard it. Join paths relative to preserve subpaths.
+        url = urljoin(panel_url.rstrip("/") + "/", f"api/users/{remote_username}/disable")
         r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
         return r.status_code, r.text[:200]
     except Exception as e:
@@ -127,7 +129,7 @@ def disable_remote(panel_url, token, remote_username):
 
 def fetch_user(panel_url: str, token: str, remote_username: str):
     try:
-        url = urljoin(panel_url.rstrip("/") + "/", f"/api/users/{remote_username}")
+        url = urljoin(panel_url.rstrip("/") + "/", f"api/users/{remote_username}")
         r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
         if r.status_code != 200:
             return None
@@ -137,7 +139,7 @@ def fetch_user(panel_url: str, token: str, remote_username: str):
 
 def fetch_links_from_panel(panel_url: str, remote_username: str, key: str):
     try:
-        url = urljoin(panel_url.rstrip("/") + "/", f"/sub/{remote_username}/{key}/links")
+        url = urljoin(panel_url.rstrip("/") + "/", f"sub/{remote_username}/{key}/links")
         r = requests.get(url, headers={"accept": "application/json"}, timeout=20)
         try:
             if r.headers.get("content-type","").startswith("application/json"):

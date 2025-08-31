@@ -69,7 +69,8 @@ def fetch_all_links():
 
 def fetch_used_traffic(panel_url, bearer, remote_username):
     try:
-        url = urljoin(panel_url.rstrip("/") + "/", f"/api/users/{remote_username}")
+        # Preserve any subpath in panel_url when joining API routes
+        url = urljoin(panel_url.rstrip("/") + "/", f"api/users/{remote_username}")
         r = requests.get(url, headers={"Authorization": f"Bearer {bearer}"}, timeout=20)
         if r.status_code != 200:
             return None, f"{panel_url}: {r.status_code} {r.text[:120]}"
@@ -125,7 +126,7 @@ def mark_user_disabled(owner_id, local_username):
 
 def disable_remote(panel_url, token, remote_username):
     try:
-        url = urljoin(panel_url.rstrip("/") + "/", f"/api/users/{remote_username}/disable")
+        url = urljoin(panel_url.rstrip("/") + "/", f"api/users/{remote_username}/disable")
         r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
         return r.status_code, r.text[:200]
     except Exception as e:
