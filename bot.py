@@ -581,15 +581,28 @@ def _panel_select_kb(panels, selected: set, mode: str):
         pid = int(p["id"])
         mark = "✅" if pid in selected else "⬜"
         title = f"{mark} {p['name']}"
-        rows.append([InlineKeyboardButton(title[:64], callback_data=f"selpanel:toggle:{pid}")])
-    controls = [
-        InlineKeyboardButton("☑️ All", callback_data="selpanel:all"),
-        InlineKeyboardButton("🔲 None", callback_data="selpanel:none"),
-    ]
-    rows.append(controls)
+        if mode == "assign":
+            cb = f"ap:toggle:{pid}"
+        else:
+            cb = f"selpanel:toggle:{pid}"
+        rows.append([InlineKeyboardButton(title[:64], callback_data=cb)])
+
+    if mode == "assign":
+        prefix = "ap"
+        apply_cb = "ap:apply"
+        cancel_cb = "ap:cancel"
+    else:
+        prefix = "selpanel"
+        apply_cb = f"selpanel:apply:{mode}"
+        cancel_cb = "selpanel:cancel"
+
     rows.append([
-        InlineKeyboardButton("✅ Apply", callback_data=f"selpanel:apply:{mode}"),
-        InlineKeyboardButton("❌ Cancel", callback_data="selpanel:cancel"),
+        InlineKeyboardButton("☑️ All", callback_data=f"{prefix}:all"),
+        InlineKeyboardButton("🔲 None", callback_data=f"{prefix}:none"),
+    ])
+    rows.append([
+        InlineKeyboardButton("✅ Apply", callback_data=apply_cb),
+        InlineKeyboardButton("❌ Cancel", callback_data=cancel_cb),
     ])
     return InlineKeyboardMarkup(rows)
 
