@@ -26,6 +26,7 @@ ENV:
 import os
 import logging
 import secrets
+import re
 from urllib.parse import urljoin, urlparse, unquote
 from datetime import datetime, timedelta, timezone
 
@@ -169,6 +170,18 @@ def ensure_schema():
                 config_name VARCHAR(255) NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE KEY uq_panel_cfg(panel_id, config_name),
+                INDEX idx_panel(panel_id),
+                FOREIGN KEY (panel_id) REFERENCES panels(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS panel_disabled_numbers(
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                telegram_user_id BIGINT NOT NULL,
+                panel_id BIGINT NOT NULL,
+                config_index INT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_panel_idx(panel_id, config_index),
                 INDEX idx_panel(panel_id),
                 FOREIGN KEY (panel_id) REFERENCES panels(id) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -473,13 +486,34 @@ def get_panel(owner_id: int, panel_id: int):
         cur.execute("SELECT * FROM panels WHERE id=%s AND telegram_user_id=%s", (int(panel_id), owner_id))
         return cur.fetchone()
 
+def canonicalize_name(name: str) -> str:
+    """Normalize a config name by removing user-specific fragments."""
+    try:
+        nm = unquote(name or "").strip()
+        nm = re.sub(r"\s*\d+(?:\.\d+)?\s*[KMGT]?B/\d+(?:\.\d+)?\s*[KMGT]?B", "", nm, flags=re.I)
+        nm = re.sub(r"\s*👤.*", "", nm)
+        nm = re.sub(r"\s*\([a-zA-Z0-9_-]{3,}\)", "", nm)
+        return nm.strip()[:255]
+    except Exception:
+        return ""
+
 def get_panel_disabled_names(panel_id: int):
     with with_mysql_cursor() as cur:
-        cur.execute("SELECT config_name FROM panel_disabled_configs WHERE panel_id=%s", (int(panel_id),))
-        return [r["config_name"] for r in cur.fetchall()]
+        cur.execute(
+            "SELECT config_name FROM panel_disabled_configs WHERE panel_id=%s",
+            (int(panel_id),),
+        )
+        # Return normalized names so callers can match reliably
+        return [
+            cn
+            for r in cur.fetchall()
+            for cn in [canonicalize_name(r["config_name"])]
+            if (r["config_name"] or "").strip() and cn
+        ]
 
 def set_panel_disabled_names(owner_id: int, panel_id: int, names):
-    clean = list({ (n or "").strip()[:255] for n in names if n and n.strip() })
+    # Normalize and dedupe names so dynamic parts don't cause mismatches
+    clean = [c for c in {canonicalize_name(n) for n in names if n and n.strip()} if c]
     with with_mysql_cursor() as cur:
         cur.execute("DELETE FROM panel_disabled_configs WHERE panel_id=%s", (int(panel_id),))
         if clean:
@@ -487,6 +521,27 @@ def set_panel_disabled_names(owner_id: int, panel_id: int, names):
                 INSERT INTO panel_disabled_configs(telegram_user_id,panel_id,config_name)
                 VALUES(%s,%s,%s)
             """, [(owner_id, int(panel_id), n) for n in clean])
+
+def get_panel_disabled_nums(panel_id: int):
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            "SELECT config_index FROM panel_disabled_numbers WHERE panel_id=%s",
+            (int(panel_id),),
+        )
+        return [int(r["config_index"]) for r in cur.fetchall() if r["config_index"]]
+
+def set_panel_disabled_nums(owner_id: int, panel_id: int, nums):
+    clean = sorted({int(n) for n in nums if str(n).isdigit() and int(n) > 0})
+    with with_mysql_cursor() as cur:
+        cur.execute("DELETE FROM panel_disabled_numbers WHERE panel_id=%s", (int(panel_id),))
+        if clean:
+            cur.executemany(
+                """
+                INSERT INTO panel_disabled_numbers(telegram_user_id,panel_id,config_index)
+                VALUES(%s,%s,%s)
+                """,
+                [(owner_id, int(panel_id), n) for n in clean],
+            )
 
 def list_panel_links(panel_id: int):
     with with_mysql_cursor() as cur:
@@ -513,6 +568,7 @@ def delete_panel_and_cleanup(owner_id: int, panel_id: int):
     with with_mysql_cursor() as cur:
         cur.execute("DELETE FROM local_user_panel_links WHERE panel_id=%s", (int(panel_id),))
         cur.execute("DELETE FROM panel_disabled_configs WHERE panel_id=%s", (int(panel_id),))
+        cur.execute("DELETE FROM panel_disabled_numbers WHERE panel_id=%s", (int(panel_id),))
         cur.execute("DELETE FROM panels WHERE id=%s AND telegram_user_id=%s", (int(panel_id), owner_id))
 
 # ---------- agents ----------
@@ -722,6 +778,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("اول لینک سابسکریپشن پنل را تنظیم کن (Set/Clear Sub URL).")
             return ConversationHandler.END
         return await show_panel_cfg_selector(q, context, uid, pid, page=0)
+    if data == "p_filter_cfgnums":
+        if not is_admin(uid): return ConversationHandler.END
+        pid = context.user_data.get("edit_panel_id")
+        info = get_panel(uid, pid)
+        if not info:
+            await q.edit_message_text("پنل پیدا نشد.")
+            return ConversationHandler.END
+        if not info.get("sub_url"):
+            await q.edit_message_text("اول لینک سابسکریپشن پنل را تنظیم کن (Set/Clear Sub URL).")
+            return ConversationHandler.END
+        return await show_panel_cfgnum_selector(q, context, uid, pid, page=0)
     if data == "p_remove":
         if not is_admin(uid): return ConversationHandler.END
         pid = context.user_data.get("edit_panel_id")
@@ -949,6 +1016,47 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, reply_markup=kb)
         return ConversationHandler.END
 
+    if data.startswith("pcnum:"):
+        pid = context.user_data.get("cfg_panel_id")
+        if not pid:
+            await q.edit_message_text("جلسه تنظیمات معتبر نیست.")
+            return ConversationHandler.END
+
+        cmd = data.split(":",1)[1]
+        titles = context.user_data.get("cfgnum_titles") or []
+        enabled = set(context.user_data.get("cfgnums_enabled") or set())
+        page = int(context.user_data.get("cfgnum_page", 0))
+        total = len(titles)
+        per = 20
+
+        if cmd == "all":
+            enabled = set(range(1, total+1))
+        elif cmd == "none":
+            enabled = set()
+        elif cmd.startswith("toggle:"):
+            idx = int(cmd.split(":",1)[1])
+            if 1 <= idx <= total:
+                if idx in enabled: enabled.remove(idx)
+                else: enabled.add(idx)
+        elif cmd.startswith("page:"):
+            np = int(cmd.split(":",1)[1])
+            if np >= 0:
+                page = np
+        elif cmd == "apply":
+            disabled = set(range(1, total+1)) - set(enabled)
+            set_panel_disabled_nums(uid, pid, disabled)
+            return await show_panel_cfgnum_selector(q, context, uid, pid, page=page, notice="✅ ذخیره شد.")
+        elif cmd == "refresh":
+            return await show_panel_cfgnum_selector(q, context, uid, pid, page=page)
+        elif cmd == "cancel":
+            return await show_panel_card(q, context, uid, pid)
+
+        context.user_data["cfgnums_enabled"] = list(enabled)
+        context.user_data["cfgnum_page"] = page
+        kb, text = build_panel_cfgnum_kb(titles, enabled, page, per)
+        await q.edit_message_text(text, reply_markup=kb)
+        return ConversationHandler.END
+
     return ConversationHandler.END
 
 # ---------- panel cfg selector UI ----------
@@ -980,6 +1088,36 @@ def build_panel_cfg_kb(names, enabled_set, page: int, per: int):
         InlineKeyboardButton("🔄 Refresh", callback_data="pcfg:refresh"),
     ])
     text = f"فهرست کانفیگ‌های پنل (صفحه {page+1})"
+    return InlineKeyboardMarkup(rows), text
+
+def build_panel_cfgnum_kb(titles, enabled_set, page: int, per: int):
+    total = len(titles)
+    start = page * per
+    end = min(start + per, total)
+    page_titles = titles[start:end]
+    rows = []
+    for idx, nm in enumerate(page_titles, start=start+1):
+        mark = "✅" if idx in enabled_set else "⬜"
+        title = f"{mark} {idx}. {nm}"
+        rows.append([InlineKeyboardButton(title[:64], callback_data=f"pcnum:toggle:{idx}")])
+    controls = [
+        InlineKeyboardButton("☑️ All", callback_data="pcnum:all"),
+        InlineKeyboardButton("🔲 None", callback_data="pcnum:none"),
+    ]
+    rows.append(controls)
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"pcnum:page:{page-1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"pcnum:page:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([
+        InlineKeyboardButton("✅ Apply", callback_data="pcnum:apply"),
+        InlineKeyboardButton("❌ Cancel", callback_data="pcnum:cancel"),
+        InlineKeyboardButton("🔄 Refresh", callback_data="pcnum:refresh"),
+    ])
+    text = f"فهرست کانفیگ‌ها بر اساس شماره (صفحه {page+1})"
     return InlineKeyboardMarkup(rows), text
 
 def extract_name(link: str) -> str:
@@ -1041,6 +1179,49 @@ async def show_panel_cfg_selector(q, context: ContextTypes.DEFAULT_TYPE, owner_i
     await q.edit_message_text(txt, reply_markup=kb)
     return ConversationHandler.END
 
+async def show_panel_cfgnum_selector(q, context: ContextTypes.DEFAULT_TYPE, owner_id: int, panel_id: int, page: int = 0, notice: str = None):
+    info = get_panel(owner_id, panel_id)
+    if not info:
+        await q.edit_message_text("پنل پیدا نشد.")
+        return ConversationHandler.END
+
+    links = []
+    if info.get("template_username"):
+        u, e = get_user(info["panel_url"], info["access_token"], info["template_username"])
+        if u and u.get("key"):
+            links = fetch_links_from_panel(info["panel_url"], info["template_username"], u["key"])
+    elif info.get("sub_url"):
+        try:
+            r = requests.get(info["sub_url"], headers={"accept": "text/plain,application/json"}, timeout=20)
+            if r.headers.get("content-type", "").startswith("application/json"):
+                data = r.json()
+                if isinstance(data, list):
+                    links = [str(x) for x in data]
+                elif isinstance(data, dict) and "links" in data:
+                    links = [str(x) for x in data["links"]]
+            else:
+                links = [ln.strip() for ln in (r.text or "").splitlines() if ln.strip()]
+        except Exception:
+            links = []
+    if not links:
+        await q.edit_message_text("ابتدا template یا لینک سابسکریپشن را تنظیم کن.")
+        return ConversationHandler.END
+
+    titles = [extract_name(s) or f"کانفیگ {i+1}" for i, s in enumerate(links)]
+    disabled = set(get_panel_disabled_nums(panel_id))
+    enabled = set(range(1, len(titles)+1)) - disabled
+
+    context.user_data["cfgnum_titles"] = titles
+    context.user_data["cfgnums_enabled"] = list(enabled)
+    context.user_data["cfgnum_page"] = page
+    context.user_data["cfg_panel_id"] = panel_id
+
+    kb, txt = build_panel_cfgnum_kb(titles, enabled, page, 20)
+    if notice:
+        txt = f"{notice}\n{txt}"
+    await q.edit_message_text(txt, reply_markup=kb)
+    return ConversationHandler.END
+
 # ---------- cards ----------
 async def show_panel_card(q, context: ContextTypes.DEFAULT_TYPE, owner_id: int, panel_id: int):
     p = get_panel(owner_id, panel_id)
@@ -1063,6 +1244,7 @@ async def show_panel_card(q, context: ContextTypes.DEFAULT_TYPE, owner_id: int, 
         [InlineKeyboardButton("✏️ Rename Panel", callback_data="p_rename")],
         [InlineKeyboardButton("🔗 Set/Clear Sub URL", callback_data="p_set_sub")],
         [InlineKeyboardButton("🧷 فیلتر کانفیگ‌های پنل", callback_data="p_filter_cfgs")],
+        [InlineKeyboardButton("🔢 فیلتر بر اساس شماره", callback_data="p_filter_cfgnums")],
         [InlineKeyboardButton("🗑️ Remove Panel", callback_data="p_remove")],
         [InlineKeyboardButton("⬅️ Back", callback_data="manage_panels")],
     ]
