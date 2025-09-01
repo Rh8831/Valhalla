@@ -201,6 +201,18 @@ def get_panel_disabled_names(panel_id: int):
             if (r["config_name"] or "").strip() and cn
         }
 
+def get_panel_disabled_nums(panel_id: int):
+    with CurCtx() as cur:
+        cur.execute(
+            "SELECT config_index FROM panel_disabled_numbers WHERE panel_id=%s",
+            (int(panel_id),),
+        )
+        return {
+            int(r["config_index"])
+            for r in cur.fetchall()
+            if isinstance(r["config_index"], (int,)) and int(r["config_index"]) > 0
+        }
+
 # ---- agent-level ----
 def get_agent(owner_id: int):
     with CurCtx() as cur:
@@ -299,27 +311,33 @@ def unified_links(local_username, app_key):
     all_links = []
     if mapped:
         for l in mapped:
-            disabled = get_panel_disabled_names(l["panel_id"])
+            disabled_names = get_panel_disabled_names(l["panel_id"])
+            disabled_nums = get_panel_disabled_nums(l["panel_id"])
             links = []
             u = fetch_user(l["panel_url"], l["access_token"], l["remote_username"])
             if u and u.get("key"):
                 links = fetch_links_from_panel(
                     l["panel_url"], l["remote_username"], u["key"]
                 )
-            if disabled:
-                links = [x for x in links if (extract_name(x) or "") not in disabled]
+            if disabled_names:
+                links = [x for x in links if (extract_name(x) or "") not in disabled_names]
+            if disabled_nums:
+                links = [x for idx, x in enumerate(links, 1) if idx not in disabled_nums]
             all_links.extend(links)
     else:
         for p in list_all_panels(owner_id):
-            disabled = get_panel_disabled_names(p["id"])
+            disabled_names = get_panel_disabled_names(p["id"])
+            disabled_nums = get_panel_disabled_nums(p["id"])
             links = []
             u = fetch_user(p["panel_url"], p["access_token"], local_username)
             if u and u.get("key"):
                 links = fetch_links_from_panel(
                     p["panel_url"], local_username, u["key"]
                 )
-            if disabled:
-                links = [x for x in links if (extract_name(x) or "") not in disabled]
+            if disabled_names:
+                links = [x for x in links if (extract_name(x) or "") not in disabled_names]
+            if disabled_nums:
+                links = [x for idx, x in enumerate(links, 1) if idx not in disabled_nums]
             all_links.extend(links)
 
     uniq = filter_dedupe(all_links)
