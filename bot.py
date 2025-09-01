@@ -26,6 +26,7 @@ ENV:
 import os
 import logging
 import secrets
+import re
 from urllib.parse import urljoin, urlparse, unquote
 from datetime import datetime, timedelta, timezone
 
@@ -473,13 +474,34 @@ def get_panel(owner_id: int, panel_id: int):
         cur.execute("SELECT * FROM panels WHERE id=%s AND telegram_user_id=%s", (int(panel_id), owner_id))
         return cur.fetchone()
 
+def canonicalize_name(name: str) -> str:
+    """Normalize a config name by removing user-specific fragments."""
+    try:
+        nm = unquote(name or "").strip()
+        nm = re.sub(r"\s*\d+(?:\.\d+)?\s*[KMGT]?B/\d+(?:\.\d+)?\s*[KMGT]?B", "", nm, flags=re.I)
+        nm = re.sub(r"\s*👤.*", "", nm)
+        nm = re.sub(r"\s*\([a-zA-Z0-9_-]{3,}\)", "", nm)
+        return nm.strip()[:255]
+    except Exception:
+        return ""
+
 def get_panel_disabled_names(panel_id: int):
     with with_mysql_cursor() as cur:
-        cur.execute("SELECT config_name FROM panel_disabled_configs WHERE panel_id=%s", (int(panel_id),))
-        return [r["config_name"] for r in cur.fetchall()]
+        cur.execute(
+            "SELECT config_name FROM panel_disabled_configs WHERE panel_id=%s",
+            (int(panel_id),),
+        )
+        # Return normalized names so callers can match reliably
+        return [
+            cn
+            for r in cur.fetchall()
+            for cn in [canonicalize_name(r["config_name"])]
+            if (r["config_name"] or "").strip() and cn
+        ]
 
 def set_panel_disabled_names(owner_id: int, panel_id: int, names):
-    clean = list({ (n or "").strip()[:255] for n in names if n and n.strip() })
+    # Normalize and dedupe names so dynamic parts don't cause mismatches
+    clean = [c for c in {canonicalize_name(n) for n in names if n and n.strip()} if c]
     with with_mysql_cursor() as cur:
         cur.execute("DELETE FROM panel_disabled_configs WHERE panel_id=%s", (int(panel_id),))
         if clean:

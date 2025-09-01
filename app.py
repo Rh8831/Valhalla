@@ -11,6 +11,7 @@ Flask subscription aggregator for Marzneshin
 
 import os
 import logging
+import re
 from urllib.parse import urljoin, unquote
 
 import requests
@@ -165,20 +166,40 @@ def filter_dedupe(links):
             out.append(ss)
     return out
 
+def canonicalize_name(name: str) -> str:
+    """Normalize a config name by stripping user-specific details."""
+    try:
+        nm = unquote(name or "").strip()
+        nm = re.sub(r"\s*\d+(?:\.\d+)?\s*[KMGT]?B/\d+(?:\.\d+)?\s*[KMGT]?B", "", nm, flags=re.I)
+        nm = re.sub(r"\s*👤.*", "", nm)
+        nm = re.sub(r"\s*\([a-zA-Z0-9_-]{3,}\)", "", nm)
+        return nm.strip()[:255]
+    except Exception:
+        return ""
+
 def extract_name(link: str) -> str:
     try:
         i = link.find("#")
         if i == -1:
             return ""
-        nm = unquote(link[i+1:]).strip()
-        return nm[:255]
+        nm = link[i+1:]
+        return canonicalize_name(nm)
     except Exception:
         return ""
 
 def get_panel_disabled_names(panel_id: int):
     with CurCtx() as cur:
-        cur.execute("SELECT config_name FROM panel_disabled_configs WHERE panel_id=%s", (int(panel_id),))
-        return {r["config_name"] for r in cur.fetchall()}
+        cur.execute(
+            "SELECT config_name FROM panel_disabled_configs WHERE panel_id=%s",
+            (int(panel_id),),
+        )
+        # Normalize names to match extract_name() output
+        return {
+            cn
+            for r in cur.fetchall()
+            for cn in [canonicalize_name(r["config_name"])]
+            if (r["config_name"] or "").strip() and cn
+        }
 
 # ---- agent-level ----
 def get_agent(owner_id: int):
