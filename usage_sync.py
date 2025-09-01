@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import requests
 from dotenv import load_dotenv
 from mysql.connector import pooling
+import mysql.connector
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | usage_sync | %(message)s",
@@ -50,22 +51,52 @@ class CurCtx:
 
 # ---------------- existing per-link / per-user logic ----------------
 
+def ensure_links_table():
+    """Create local_user_panel_links table if missing."""
+    with CurCtx(dict_=False) as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS local_user_panel_links(
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                owner_id BIGINT NOT NULL,
+                local_username VARCHAR(64) NOT NULL,
+                panel_id BIGINT NOT NULL,
+                remote_username VARCHAR(128) NOT NULL,
+                last_used_traffic BIGINT NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_link(owner_id, local_username, panel_id),
+                FOREIGN KEY (panel_id) REFERENCES panels(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+            """
+        )
+
+
 def fetch_all_links():
-    with CurCtx() as cur:
-        cur.execute("""
-            SELECT lup.id AS link_id,
-                   lup.owner_id,
-                   lup.local_username,
-                   lup.panel_id,
-                   lup.remote_username,
-                   lup.last_used_traffic,
-                   p.panel_url,
-                   p.access_token
-            FROM local_user_panel_links lup
-            JOIN panels p ON p.id = lup.panel_id
-            ORDER BY lup.id ASC
-        """)
-        return cur.fetchall()
+    try:
+        with CurCtx() as cur:
+            cur.execute(
+                """
+                SELECT lup.id AS link_id,
+                       lup.owner_id,
+                       lup.local_username,
+                       lup.panel_id,
+                       lup.remote_username,
+                       lup.last_used_traffic,
+                       p.panel_url,
+                       p.access_token
+                FROM local_user_panel_links lup
+                JOIN panels p ON p.id = lup.panel_id
+                ORDER BY lup.id ASC
+                """
+            )
+            return cur.fetchall()
+    except mysql.connector.errors.ProgrammingError as e:
+        if getattr(e, "errno", None) == 1146:  # table doesn't exist
+            log.warning("local_user_panel_links table missing; creating")
+            ensure_links_table()
+            return []
+        raise
 
 def fetch_used_traffic(panel_url, bearer, remote_username):
     try:
