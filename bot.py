@@ -475,11 +475,26 @@ def get_panel(owner_id: int, panel_id: int):
 
 def get_panel_disabled_names(panel_id: int):
     with with_mysql_cursor() as cur:
-        cur.execute("SELECT config_name FROM panel_disabled_configs WHERE panel_id=%s", (int(panel_id),))
-        return [r["config_name"] for r in cur.fetchall()]
+        cur.execute(
+            "SELECT config_name FROM panel_disabled_configs WHERE panel_id=%s",
+            (int(panel_id),),
+        )
+        # Return normalized names so callers can match reliably
+        return [
+            unquote(r["config_name"]).strip()
+            for r in cur.fetchall()
+            if (r["config_name"] or "").strip()
+        ]
 
 def set_panel_disabled_names(owner_id: int, panel_id: int, names):
-    clean = list({ (n or "").strip()[:255] for n in names if n and n.strip() })
+    # Normalize and dedupe names (strip & percent-decode)
+    clean = list(
+        {
+            unquote((n or "").strip())[:255]
+            for n in names
+            if n and n.strip()
+        }
+    )
     with with_mysql_cursor() as cur:
         cur.execute("DELETE FROM panel_disabled_configs WHERE panel_id=%s", (int(panel_id),))
         if clean:

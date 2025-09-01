@@ -177,8 +177,16 @@ def extract_name(link: str) -> str:
 
 def get_panel_disabled_names(panel_id: int):
     with CurCtx() as cur:
-        cur.execute("SELECT config_name FROM panel_disabled_configs WHERE panel_id=%s", (int(panel_id),))
-        return {r["config_name"] for r in cur.fetchall()}
+        cur.execute(
+            "SELECT config_name FROM panel_disabled_configs WHERE panel_id=%s",
+            (int(panel_id),),
+        )
+        # Normalize names to match extract_name() output (strip & percent-decode)
+        return {
+            unquote(r["config_name"]).strip()
+            for r in cur.fetchall()
+            if (r["config_name"] or "").strip()
+        }
 
 # ---- agent-level ----
 def get_agent(owner_id: int):
