@@ -296,6 +296,51 @@ def get_user(panel_url, token, username):
     except Exception as e:
         return None, str(e)[:200]
 
+def fetch_links_from_panel(panel_url: str, username: str, key: str):
+    try:
+        url = urljoin(panel_url.rstrip('/') + '/', f"sub/{username}/{key}/links")
+        r = requests.get(url, headers={"accept": "application/json"}, timeout=20)
+        try:
+            if r.headers.get("content-type", "").startswith("application/json"):
+                data = r.json()
+                if isinstance(data, list):
+                    return [str(x) for x in data]
+                if isinstance(data, dict) and "links" in data:
+                    return [str(x) for x in data["links"]]
+        except Exception:
+            pass
+        return [ln.strip() for ln in (r.text or "").splitlines() if ln.strip()]
+    except Exception:
+        return []
+
+def links_from_user_obj(user):
+    """Normalize link data from panel user API responses.
+
+    Returns a list of enabled config links or ``None`` if no links field was
+    found so callers can fall back to subscription URLs."""
+    if not isinstance(user, dict):
+        return None
+    links = user.get("links")
+    if not isinstance(links, list):
+        return None
+    out = []
+    for item in links:
+        if isinstance(item, str):
+            out.append(item)
+            continue
+        if isinstance(item, dict):
+            enabled = item.get("enable")
+            if enabled is None:
+                enabled = item.get("enabled")
+            if enabled is None:
+                enabled = item.get("status")
+            if enabled is False:
+                continue
+            link = item.get("link") or item.get("url") or item.get("config")
+            if link:
+                out.append(str(link))
+    return out if out else None
+
 def disable_remote_user(panel_url, token, username):
     try:
         r = requests.post(
@@ -977,23 +1022,35 @@ def extract_name(link: str) -> str:
 
 async def show_panel_cfg_selector(q, context: ContextTypes.DEFAULT_TYPE, owner_id: int, panel_id: int, page: int = 0, notice: str = None):
     info = get_panel(owner_id, panel_id)
-    if not info or not info.get("sub_url"):
-        await q.edit_message_text("ابتدا لینک سابسکریپشن پنل را تنظیم کن.")
+    if not info:
+        await q.edit_message_text("پنل پیدا نشد.")
         return ConversationHandler.END
 
     links = []
-    try:
-        r = requests.get(info["sub_url"], headers={"accept":"text/plain,application/json"}, timeout=20)
-        if r.headers.get("content-type","").startswith("application/json"):
-            data = r.json()
-            if isinstance(data, list):
-                links = [str(x) for x in data]
-            elif isinstance(data, dict) and "links" in data:
-                links = [str(x) for x in data["links"]]
-        else:
-            links = [ln.strip() for ln in (r.text or "").splitlines() if ln.strip()]
-    except Exception:
-        links = []
+    if info.get("template_username"):
+        u, e = get_user(info["panel_url"], info["access_token"], info["template_username"])
+        if u:
+            api_links = links_from_user_obj(u)
+            if api_links is not None:
+                links = api_links
+            elif u.get("key"):
+                links = fetch_links_from_panel(info["panel_url"], info["template_username"], u["key"])
+    elif info.get("sub_url"):
+        try:
+            r = requests.get(info["sub_url"], headers={"accept": "text/plain,application/json"}, timeout=20)
+            if r.headers.get("content-type", "").startswith("application/json"):
+                data = r.json()
+                if isinstance(data, list):
+                    links = [str(x) for x in data]
+                elif isinstance(data, dict) and "links" in data:
+                    links = [str(x) for x in data["links"]]
+            else:
+                links = [ln.strip() for ln in (r.text or "").splitlines() if ln.strip()]
+        except Exception:
+            links = []
+    if not links:
+        await q.edit_message_text("ابتدا template یا لینک سابسکریپشن را تنظیم کن.")
+        return ConversationHandler.END
 
     seen, names = set(), []
     for s in links:

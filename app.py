@@ -6,7 +6,7 @@ Flask subscription aggregator for Marzneshin
 - Returns only configs (ss://, vless://, vmess://, trojan://), one per line (text/plain)
 - Enforces local quota. If user quota exceeded -> empty body + DISABLE remote (once).
 - NEW: Enforces AGENT-level quota/expiry too: if agent exhausted/expired -> empty body + DISABLE ALL agent users (once).
-- Panel-level subscription URL + per-panel disabled config-name filters (anything after '#' is the name).
+- Supports per-panel disabled config-name filters (anything after '#' is the name).
 """
 
 import os
@@ -77,20 +77,36 @@ def get_local_user(owner_id, local_username):
         return cur.fetchone()
 
 def list_mapped_links(owner_id, local_username):
+    """Return panel link mappings for a local user.
+
+    Only the data required for API-based subscription fetching is selected; any
+    panel-level subscription URL configured for name filtering is ignored here.
+    """
     with CurCtx() as cur:
-        cur.execute("""
+        cur.execute(
+            """
             SELECT lup.panel_id, lup.remote_username,
-                   p.panel_url, p.access_token, p.sub_url
+                   p.panel_url, p.access_token
             FROM local_user_panel_links lup
             JOIN panels p ON p.id = lup.panel_id
             WHERE lup.owner_id=%s AND lup.local_username=%s
-        """, (owner_id, local_username))
+            """,
+            (owner_id, local_username),
+        )
         return cur.fetchall()
 
 def list_all_panels(owner_id):
-    # owner_id اینجا همان ادمین پنل‌ها نیست؛ برای fallback عمومی همین را می‌خوانیم
+    """List all panels for an owner for fallback resolution.
+
+    Subscription URLs stored for config-name filtering are intentionally not
+    returned as the unified subscription now fetches configs directly via the
+    panel API.
+    """
     with CurCtx() as cur:
-        cur.execute("SELECT id, panel_url, access_token, sub_url FROM panels WHERE telegram_user_id=%s", (owner_id,))
+        cur.execute(
+            "SELECT id, panel_url, access_token FROM panels WHERE telegram_user_id=%s",
+            (owner_id,),
+        )
         return cur.fetchall()
 
 def mark_user_disabled(owner_id, local_username):
@@ -103,7 +119,9 @@ def mark_user_disabled(owner_id, local_username):
 
 def disable_remote(panel_url, token, remote_username):
     try:
-        url = urljoin(panel_url.rstrip("/") + "/", f"/api/users/{remote_username}/disable")
+        # panel_url may already include a path component; urljoin with a leading
+        # slash would discard it. Join paths relative to preserve subpaths.
+        url = urljoin(panel_url.rstrip("/") + "/", f"api/users/{remote_username}/disable")
         r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
         return r.status_code, r.text[:200]
     except Exception as e:
@@ -111,7 +129,7 @@ def disable_remote(panel_url, token, remote_username):
 
 def fetch_user(panel_url: str, token: str, remote_username: str):
     try:
-        url = urljoin(panel_url.rstrip("/") + "/", f"/api/users/{remote_username}")
+        url = urljoin(panel_url.rstrip("/") + "/", f"api/users/{remote_username}")
         r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
         if r.status_code != 200:
             return None
@@ -121,7 +139,7 @@ def fetch_user(panel_url: str, token: str, remote_username: str):
 
 def fetch_links_from_panel(panel_url: str, remote_username: str, key: str):
     try:
-        url = urljoin(panel_url.rstrip("/") + "/", f"/sub/{remote_username}/{key}/links")
+        url = urljoin(panel_url.rstrip("/") + "/", f"sub/{remote_username}/{key}/links")
         r = requests.get(url, headers={"accept": "application/json"}, timeout=20)
         try:
             if r.headers.get("content-type","").startswith("application/json"):
@@ -136,21 +154,36 @@ def fetch_links_from_panel(panel_url: str, remote_username: str, key: str):
     except:
         return []
 
-def fetch_links_by_url(sub_url: str):
-    try:
-        r = requests.get(sub_url, headers={"accept": "application/json,text/plain"}, timeout=20)
-        try:
-            if r.headers.get("content-type","").startswith("application/json"):
-                data = r.json()
-                if isinstance(data, list):
-                    return [str(x) for x in data]
-                if isinstance(data, dict) and "links" in data:
-                    return [str(x) for x in data["links"]]
-        except:
-            pass
-        return [ln.strip() for ln in (r.text or "").splitlines() if ln.strip()]
-    except:
-        return []
+def links_from_user_obj(user):
+    """Extract enabled config links from a user JSON object.
+
+    The panel API may return links either as simple strings or as objects with
+    an enable/disable flag. This helper normalizes the structure and returns a
+    list of link strings for enabled configs. If no links are present the
+    function returns ``None`` so callers can fall back to subscription URLs.
+    """
+    if not isinstance(user, dict):
+        return None
+    links = user.get("links")
+    if not isinstance(links, list):
+        return None
+    out = []
+    for item in links:
+        if isinstance(item, str):
+            out.append(item)
+            continue
+        if isinstance(item, dict):
+            enabled = item.get("enable")
+            if enabled is None:
+                enabled = item.get("enabled")
+            if enabled is None:
+                enabled = item.get("status")
+            if enabled is False:
+                continue
+            link = item.get("link") or item.get("url") or item.get("config")
+            if link:
+                out.append(str(link))
+    return out if out else None
 
 def filter_dedupe(links):
     out, seen = [], set()
@@ -271,19 +304,22 @@ def unified_links(local_username, app_key):
         resp.headers["X-Disabled-Pushed"] = "1"
         return resp
 
-    # ---- Aggregate & filter links (panel-level sub_url + per-panel name filters) ----
+    # ---- Aggregate & filter links (per-panel config-name filters) ----
     mapped = list_mapped_links(owner_id, local_username)
     all_links = []
     if mapped:
         for l in mapped:
             disabled = get_panel_disabled_names(l["panel_id"])
             links = []
-            if l.get("sub_url"):
-                links = fetch_links_by_url(l["sub_url"])
-            else:
-                u = fetch_user(l["panel_url"], l["access_token"], l["remote_username"])
-                if u and u.get("key"):
-                    links = fetch_links_from_panel(l["panel_url"], l["remote_username"], u["key"])
+            u = fetch_user(l["panel_url"], l["access_token"], l["remote_username"])
+            if u:
+                api_links = links_from_user_obj(u)
+                if api_links is not None:
+                    links = api_links
+                elif u.get("key"):
+                    links = fetch_links_from_panel(
+                        l["panel_url"], l["remote_username"], u["key"]
+                    )
             if disabled:
                 links = [x for x in links if (extract_name(x) or "") not in disabled]
             all_links.extend(links)
@@ -291,12 +327,15 @@ def unified_links(local_username, app_key):
         for p in list_all_panels(owner_id):
             disabled = get_panel_disabled_names(p["id"])
             links = []
-            if p.get("sub_url"):
-                links = fetch_links_by_url(p["sub_url"])
-            else:
-                u = fetch_user(p["panel_url"], p["access_token"], local_username)
-                if u and u.get("key"):
-                    links = fetch_links_from_panel(p["panel_url"], local_username, u["key"])
+            u = fetch_user(p["panel_url"], p["access_token"], local_username)
+            if u:
+                api_links = links_from_user_obj(u)
+                if api_links is not None:
+                    links = api_links
+                elif u.get("key"):
+                    links = fetch_links_from_panel(
+                        p["panel_url"], local_username, u["key"]
+                    )
             if disabled:
                 links = [x for x in links if (extract_name(x) or "") not in disabled]
             all_links.extend(links)
