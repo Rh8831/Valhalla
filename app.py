@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flask subscription aggregator for Marzneshin
+Flask subscription aggregator for Marzneshin/Marzban panels
 - GET /sub/<local_username>/<app_key>/links
 - Returns only configs (ss://, vless://, vmess://, trojan://), one per line (text/plain)
 - Enforces local quota. If user quota exceeded -> empty body + DISABLE remote (once).
@@ -14,6 +14,7 @@ import logging
 import re
 from urllib.parse import urljoin, unquote
 
+import base64
 import requests
 from flask import Flask, Response, abort
 from dotenv import load_dotenv
@@ -120,10 +121,19 @@ def mark_user_disabled(owner_id, local_username):
 
 def disable_remote(panel_url, token, remote_username):
     try:
-        # panel_url may already include a path component; urljoin with a leading
-        # slash would discard it. Join paths relative to preserve subpaths.
+        # Try Marzneshin style first
         url = urljoin(panel_url.rstrip("/") + "/", f"api/users/{remote_username}/disable")
         r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
+        if r.status_code == 200:
+            return r.status_code, r.text[:200]
+        # Fallback to Marzban style
+        url = urljoin(panel_url.rstrip("/") + "/", f"api/user/{remote_username}")
+        r = requests.put(
+            url,
+            json={"status": "disabled"},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            timeout=20,
+        )
         return r.status_code, r.text[:200]
     except Exception as e:
         return None, str(e)
@@ -132,28 +142,74 @@ def fetch_user(panel_url: str, token: str, remote_username: str):
     try:
         url = urljoin(panel_url.rstrip("/") + "/", f"api/users/{remote_username}")
         r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+        # Fallback to Marzban endpoint
+        url = urljoin(panel_url.rstrip("/") + "/", f"api/user/{remote_username}")
+        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
         if r.status_code != 200:
             return None
-        return r.json()
+        obj = r.json()
+        status = obj.get("status")
+        obj["enabled"] = status != "disabled"
+        sub_url = obj.get("subscription_url") or ""
+        token_part = sub_url.rstrip("/").split("/")[-1]
+        if token_part:
+            obj.setdefault("key", token_part)
+        return obj
     except:
         return None
 
+
 def fetch_links_from_panel(panel_url: str, remote_username: str, key: str):
+    """Return links and an optional error message for debugging."""
+    errors = []
     try:
+        # Try Marzban style first (/v2ray base64)
+        url = urljoin(panel_url.rstrip("/") + "/", f"sub/{key}/v2ray")
+        r = requests.get(url, headers={"accept": "text/plain"}, timeout=20)
+        if r.status_code == 200:
+            txt = (r.text or "").strip()
+            if txt:
+                try:
+                    decoded = base64.b64decode(txt + "===")
+                    txt = decoded.decode(errors="ignore")
+                except Exception as e:
+                    errors.append(f"v2ray b64 {e}")
+                lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+                if any(ln.lower().startswith(ALLOWED_SCHEMES) for ln in lines):
+                    return lines, None
+                errors.append("v2ray empty")
+        else:
+            errors.append(f"v2ray HTTP {r.status_code}")
+
+        # Fallback to Marzneshin style
         url = urljoin(panel_url.rstrip("/") + "/", f"sub/{remote_username}/{key}/links")
-        r = requests.get(url, headers={"accept": "application/json"}, timeout=20)
+        r = requests.get(url, headers={"accept": "application/json,text/plain"}, timeout=20)
+        if r.status_code != 200:
+            errors.append(f"links HTTP {r.status_code}")
+            return [], "; ".join(errors)
         try:
-            if r.headers.get("content-type","").startswith("application/json"):
+            if r.headers.get("content-type", "").startswith("application/json"):
                 data = r.json()
                 if isinstance(data, list):
-                    return [str(x) for x in data]
+                    return [str(x) for x in data], None
                 if isinstance(data, dict) and "links" in data:
-                    return [str(x) for x in data["links"]]
-        except:
-            pass
-        return [ln.strip() for ln in (r.text or "").splitlines() if ln.strip()]
-    except:
-        return []
+                    return [str(x) for x in data["links"]], None
+        except Exception as e:
+            errors.append(f"json {e}")
+        lines = [
+            ln.strip()
+            for ln in (r.text or "").splitlines()
+            if ln.strip() and ln.strip().lower().startswith(ALLOWED_SCHEMES)
+        ]
+        if lines:
+            return lines, None
+        errors.append("links empty")
+        return [], "; ".join(errors)
+    except Exception as e:
+        errors.append(str(e))
+        return [], "; ".join(errors)
 
 def filter_dedupe(links):
     out, seen = [], set()
@@ -309,17 +365,21 @@ def unified_links(local_username, app_key):
 
     # ---- Aggregate & filter links (per-panel config-name filters) ----
     mapped = list_mapped_links(owner_id, local_username)
-    all_links = []
+    all_links, errors = [], []
     if mapped:
         for l in mapped:
             disabled_names = get_panel_disabled_names(l["panel_id"])
             disabled_nums = get_panel_disabled_nums(l["panel_id"])
             links = []
+            err = None
             u = fetch_user(l["panel_url"], l["access_token"], l["remote_username"])
             if u and u.get("key"):
-                links = fetch_links_from_panel(
+                links, err = fetch_links_from_panel(
                     l["panel_url"], l["remote_username"], u["key"]
                 )
+            if err:
+                log.warning("fetch %s@%s -> %s", l["remote_username"], l["panel_url"], err)
+                errors.append(f"{l['remote_username']}@{l['panel_url']}: {err}")
             if disabled_names:
                 links = [x for x in links if (extract_name(x) or "") not in disabled_names]
             if disabled_nums:
@@ -330,11 +390,15 @@ def unified_links(local_username, app_key):
             disabled_names = get_panel_disabled_names(p["id"])
             disabled_nums = get_panel_disabled_nums(p["id"])
             links = []
+            err = None
             u = fetch_user(p["panel_url"], p["access_token"], local_username)
             if u and u.get("key"):
-                links = fetch_links_from_panel(
+                links, err = fetch_links_from_panel(
                     p["panel_url"], local_username, u["key"]
                 )
+            if err:
+                log.warning("fetch %s@%s -> %s", local_username, p["panel_url"], err)
+                errors.append(f"{local_username}@{p['panel_url']}: {err}")
             if disabled_names:
                 links = [x for x in links if (extract_name(x) or "") not in disabled_names]
             if disabled_nums:
@@ -342,7 +406,12 @@ def unified_links(local_username, app_key):
             all_links.extend(links)
 
     uniq = filter_dedupe(all_links)
-    body = "\n".join(uniq) + ("\n" if uniq else "")
+    if uniq:
+        body = "\n".join(uniq) + "\n"
+    elif errors:
+        body = "\n".join(f"# {e}" for e in errors) + "\n"
+    else:
+        body = ""
 
     remaining = (limit - used) if limit > 0 else -1
     resp = Response(body, mimetype="text/plain")
