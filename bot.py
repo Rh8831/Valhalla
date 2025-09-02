@@ -35,7 +35,6 @@ from mysql.connector import pooling, Error as MySQLError
 
 import marzneshin
 import marzban
-from marzneshin import fetch_subscription_links
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -1092,7 +1091,7 @@ async def show_panel_cfg_selector(q, context: ContextTypes.DEFAULT_TYPE, owner_i
         if u and u.get("key"):
             links = api.fetch_links_from_panel(info["panel_url"], info["template_username"], u["key"])
     elif info.get("sub_url"):
-        links = fetch_subscription_links(info["sub_url"])
+        links = api.fetch_subscription_links(info["sub_url"])
     if not links:
         await q.edit_message_text("ابتدا template یا لینک سابسکریپشن را تنظیم کن.")
         return ConversationHandler.END
@@ -1131,7 +1130,7 @@ async def show_panel_cfgnum_selector(q, context: ContextTypes.DEFAULT_TYPE, owne
         if u and u.get("key"):
             links = api.fetch_links_from_panel(info["panel_url"], info["template_username"], u["key"])
     elif info.get("sub_url"):
-        links = fetch_subscription_links(info["sub_url"])
+        links = api.fetch_subscription_links(info["sub_url"])
     if not links:
         await q.edit_message_text("ابتدا template یا لینک سابسکریپشن را تنظیم کن.")
         return ConversationHandler.END
