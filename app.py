@@ -19,6 +19,7 @@ import requests
 from flask import Flask, Response, abort
 from dotenv import load_dotenv
 from mysql.connector import pooling
+import sanaei
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | flask_agg | %(message)s",
@@ -88,7 +89,7 @@ def list_mapped_links(owner_id, local_username):
         cur.execute(
             """
             SELECT lup.panel_id, lup.remote_username,
-                   p.panel_url, p.access_token
+                   p.panel_url, p.access_token, p.panel_type
             FROM local_user_panel_links lup
             JOIN panels p ON p.id = lup.panel_id
             WHERE lup.owner_id=%s AND lup.local_username=%s
@@ -106,7 +107,7 @@ def list_all_panels(owner_id):
     """
     with CurCtx() as cur:
         cur.execute(
-            "SELECT id, panel_url, access_token FROM panels WHERE telegram_user_id=%s",
+            "SELECT id, panel_url, access_token, panel_type FROM panels WHERE telegram_user_id=%s",
             (owner_id,),
         )
         return cur.fetchall()
@@ -119,8 +120,11 @@ def mark_user_disabled(owner_id, local_username):
             WHERE owner_id=%s AND username=%s
         """, (owner_id, local_username))
 
-def disable_remote(panel_url, token, remote_username):
+def disable_remote(panel_type, panel_url, token, remote_username):
     try:
+        if panel_type == "sanaei":
+            ok, msg = sanaei.disable_remote_user(panel_url, token, remote_username)
+            return (200 if ok else None), msg
         # Try Marzneshin style first
         url = urljoin(panel_url.rstrip("/") + "/", f"api/users/{remote_username}/disable")
         r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
@@ -289,7 +293,7 @@ def get_agent_total_used(owner_id: int) -> int:
 def list_all_agent_links(owner_id: int):
     with CurCtx() as cur:
         cur.execute("""
-            SELECT lup.local_username, lup.remote_username, p.panel_url, p.access_token
+            SELECT lup.local_username, lup.remote_username, p.panel_url, p.access_token, p.panel_type
             FROM local_user_panel_links lup
             JOIN panels p ON p.id = lup.panel_id
             WHERE lup.owner_id=%s
@@ -328,7 +332,7 @@ def unified_links(local_username, app_key):
             if not pushed_a:
                 # disable ALL users of this agent across all panels (once)
                 for l in list_all_agent_links(owner_id):
-                    code, msg = disable_remote(l["panel_url"], l["access_token"], l["remote_username"])
+                    code, msg = disable_remote(l["panel_type"], l["panel_url"], l["access_token"], l["remote_username"])
                     if code and code != 200:
                         log.warning("AGENT disable on %s@%s -> %s %s",
                                     l["remote_username"], l["panel_url"], code, msg)
@@ -350,9 +354,10 @@ def unified_links(local_username, app_key):
             if not links:
                 panels = list_all_panels(owner_id)
                 links = [{"panel_id": p["id"], "remote_username": local_username,
-                          "panel_url": p["panel_url"], "access_token": p["access_token"]} for p in panels]
+                          "panel_url": p["panel_url"], "access_token": p["access_token"],
+                          "panel_type": p["panel_type"]} for p in panels]
             for l in links:
-                code, msg = disable_remote(l["panel_url"], l["access_token"], l["remote_username"])
+                code, msg = disable_remote(l["panel_type"], l["panel_url"], l["access_token"], l["remote_username"])
                 if code and code != 200:
                     log.warning("disable on %s@%s -> %s %s", l["remote_username"], l["panel_url"], code, msg)
             mark_user_disabled(owner_id, local_username)
@@ -372,11 +377,16 @@ def unified_links(local_username, app_key):
             disabled_nums = get_panel_disabled_nums(l["panel_id"])
             links = []
             err = None
-            u = fetch_user(l["panel_url"], l["access_token"], l["remote_username"])
-            if u and u.get("key"):
-                links, err = fetch_links_from_panel(
-                    l["panel_url"], l["remote_username"], u["key"]
+            if l.get("panel_type") == "sanaei":
+                links, err = sanaei.fetch_links_from_panel(
+                    l["panel_url"], l["access_token"], l["remote_username"]
                 )
+            else:
+                u = fetch_user(l["panel_url"], l["access_token"], l["remote_username"])
+                if u and u.get("key"):
+                    links, err = fetch_links_from_panel(
+                        l["panel_url"], l["remote_username"], u["key"]
+                    )
             if err:
                 log.warning("fetch %s@%s -> %s", l["remote_username"], l["panel_url"], err)
                 errors.append(f"{l['remote_username']}@{l['panel_url']}: {err}")
@@ -391,11 +401,16 @@ def unified_links(local_username, app_key):
             disabled_nums = get_panel_disabled_nums(p["id"])
             links = []
             err = None
-            u = fetch_user(p["panel_url"], p["access_token"], local_username)
-            if u and u.get("key"):
-                links, err = fetch_links_from_panel(
-                    p["panel_url"], local_username, u["key"]
+            if p.get("panel_type") == "sanaei":
+                links, err = sanaei.fetch_links_from_panel(
+                    p["panel_url"], p["access_token"], local_username
                 )
+            else:
+                u = fetch_user(p["panel_url"], p["access_token"], local_username)
+                if u and u.get("key"):
+                    links, err = fetch_links_from_panel(
+                        p["panel_url"], local_username, u["key"]
+                    )
             if err:
                 log.warning("fetch %s@%s -> %s", local_username, p["panel_url"], err)
                 errors.append(f"{local_username}@{p['panel_url']}: {err}")
