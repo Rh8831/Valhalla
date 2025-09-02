@@ -27,12 +27,22 @@ import os
 import logging
 import secrets
 import re
-from urllib.parse import urljoin, urlparse, unquote
+from urllib.parse import urlparse, unquote
 from datetime import datetime, timedelta, timezone
 
-import requests
 from dotenv import load_dotenv
 from mysql.connector import pooling, Error as MySQLError
+
+from marzneshin import (
+    fetch_user_services,
+    create_user,
+    get_user,
+    fetch_links_from_panel,
+    disable_remote_user,
+    enable_remote_user,
+    fetch_subscription_links,
+    get_admin_token,
+)
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -258,8 +268,6 @@ def gb_to_bytes(txt: str) -> int:
         gb = 0.0
     return int(gb * (UNIT**3))
 
-def get_headers(t): return {"Authorization": f"Bearer {t}"}
-
 def make_panel_name(url, u):
     try:
         h = urlparse(url).hostname or url
@@ -268,87 +276,6 @@ def make_panel_name(url, u):
     h = str(h).replace("www.", "")
     base = f"{h}-{u}".strip("-")
     return (base[:120] if len(base) > 120 else base) or "panel"
-
-# ---------- API helpers ----------
-def fetch_user_services(panel_url, token, username):
-    try:
-        r = requests.get(
-            urljoin(panel_url.rstrip('/')+'/', f"/api/users/{username}/services"),
-            headers=get_headers(token), timeout=15
-        )
-        if r.status_code != 200:
-            return None, f"{r.status_code} {r.text[:200]}"
-        items = (r.json() or {}).get("items") or []
-        return [it["id"] for it in items if isinstance(it.get("id"), int)], None
-    except Exception as e:
-        return None, str(e)[:200]
-
-def create_user(panel_url, token, payload: dict):
-    try:
-        r = requests.post(
-            urljoin(panel_url.rstrip('/')+'/', '/api/users'),
-            json=payload,
-            headers={**get_headers(token), "Content-Type": "application/json"},
-            timeout=20
-        )
-        if r.status_code == 200:
-            return r.json(), None
-        return None, f"{r.status_code} {r.text[:300]}"
-    except Exception as e:
-        return None, str(e)[:200]
-
-def get_user(panel_url, token, username):
-    try:
-        r = requests.get(
-            urljoin(panel_url.rstrip('/')+'/', f"/api/users/{username}"),
-            headers=get_headers(token), timeout=15
-        )
-        if r.status_code == 200:
-            return r.json(), None
-        return None, f"{r.status_code} {r.text[:200]}"
-    except Exception as e:
-        return None, str(e)[:200]
-
-def fetch_links_from_panel(panel_url: str, username: str, key: str):
-    try:
-        url = urljoin(panel_url.rstrip('/') + '/', f"sub/{username}/{key}/links")
-        r = requests.get(url, headers={"accept": "application/json"}, timeout=20)
-        try:
-            if r.headers.get("content-type", "").startswith("application/json"):
-                data = r.json()
-                if isinstance(data, list):
-                    return [str(x) for x in data]
-                if isinstance(data, dict) and "links" in data:
-                    return [str(x) for x in data["links"]]
-        except Exception:
-            pass
-        return [ln.strip() for ln in (r.text or "").splitlines() if ln.strip()]
-    except Exception:
-        return []
-
-def disable_remote_user(panel_url, token, username):
-    try:
-        r = requests.post(
-            urljoin(panel_url.rstrip('/')+'/', f"/api/users/{username}/disable"),
-            headers=get_headers(token), timeout=20
-        )
-        if r.status_code == 200:
-            return True, None
-        return False, f"{r.status_code} {r.text[:200]}"
-    except Exception as e:
-        return False, str(e)[:200]
-
-def enable_remote_user(panel_url, token, username):
-    try:
-        r = requests.post(
-            urljoin(panel_url.rstrip('/')+'/', f"/api/users/{username}/enable"),
-            headers=get_headers(token), timeout=20
-        )
-        if r.status_code == 200:
-            return True, None
-        return False, f"{r.status_code} {r.text[:200]}"
-    except Exception as e:
-        return False, str(e)[:200]
 
 # ---------- data access ----------
 def list_my_panels_admin(admin_tg_id: int):
@@ -1152,18 +1079,7 @@ async def show_panel_cfg_selector(q, context: ContextTypes.DEFAULT_TYPE, owner_i
         if u and u.get("key"):
             links = fetch_links_from_panel(info["panel_url"], info["template_username"], u["key"])
     elif info.get("sub_url"):
-        try:
-            r = requests.get(info["sub_url"], headers={"accept": "text/plain,application/json"}, timeout=20)
-            if r.headers.get("content-type", "").startswith("application/json"):
-                data = r.json()
-                if isinstance(data, list):
-                    links = [str(x) for x in data]
-                elif isinstance(data, dict) and "links" in data:
-                    links = [str(x) for x in data["links"]]
-            else:
-                links = [ln.strip() for ln in (r.text or "").splitlines() if ln.strip()]
-        except Exception:
-            links = []
+        links = fetch_subscription_links(info["sub_url"])
     if not links:
         await q.edit_message_text("ابتدا template یا لینک سابسکریپشن را تنظیم کن.")
         return ConversationHandler.END
@@ -1201,18 +1117,7 @@ async def show_panel_cfgnum_selector(q, context: ContextTypes.DEFAULT_TYPE, owne
         if u and u.get("key"):
             links = fetch_links_from_panel(info["panel_url"], info["template_username"], u["key"])
     elif info.get("sub_url"):
-        try:
-            r = requests.get(info["sub_url"], headers={"accept": "text/plain,application/json"}, timeout=20)
-            if r.headers.get("content-type", "").startswith("application/json"):
-                data = r.json()
-                if isinstance(data, list):
-                    links = [str(x) for x in data]
-                elif isinstance(data, dict) and "links" in data:
-                    links = [str(x) for x in data["links"]]
-            else:
-                links = [ln.strip() for ln in (r.text or "").splitlines() if ln.strip()]
-        except Exception:
-            links = []
+        links = fetch_subscription_links(info["sub_url"])
     if not links:
         await q.edit_message_text("ابتدا template یا لینک سابسکریپشن را تنظیم کن.")
         return ConversationHandler.END
@@ -1381,22 +1286,19 @@ async def got_panel_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     panel_user = context.user_data.get("panel_user")
     panel_name = context.user_data.get("panel_name") or make_panel_name(panel_url, panel_user)
     password = (update.message.text or "").strip()
-    token_url = urljoin(panel_url+'/', '/api/admins/token')
     try:
-        resp = requests.post(token_url, data={"username": panel_user, "password": password, "grant_type": "password"}, timeout=15)
-        if resp.status_code != 200:
-            await update.message.reply_text(f"❌ لاگین ناموفق: {resp.status_code} {resp.text[:200]}")
-            return ConversationHandler.END
-        tok = (resp.json() or {}).get("access_token")
+        tok, err = get_admin_token(panel_url, panel_user, password)
         if not tok:
-            await update.message.reply_text("❌ access_token دریافت نشد.")
+            await update.message.reply_text(f"❌ لاگین ناموفق: {err}")
             return ConversationHandler.END
         with with_mysql_cursor() as cur:
             cur.execute(
                 "INSERT INTO panels(telegram_user_id,panel_url,name,admin_username,access_token)VALUES(%s,%s,%s,%s,%s)",
                 (update.effective_user.id, panel_url, panel_name, panel_user, tok)
             )
-        await update.message.reply_text(f"✅ پنل اضافه شد: {panel_name}\nنکته: از 🛠️ Manage Panels می‌تونی Template و Sub URL را ست کنی.")
+        await update.message.reply_text(
+            f"✅ پنل اضافه شد: {panel_name}\nنکته: از 🛠️ Manage Panels می‌تونی Template و Sub URL را ست کنی."
+        )
     except MySQLError as e:
         await update.message.reply_text(f"❌ خطای DB: {e}")
     except Exception as e:
@@ -1468,17 +1370,16 @@ async def got_edit_panel_pass(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
     try:
         with with_mysql_cursor() as cur:
-            cur.execute("SELECT panel_url FROM panels WHERE id=%s AND telegram_user_id=%s", (pid, update.effective_user.id))
+            cur.execute(
+                "SELECT panel_url FROM panels WHERE id=%s AND telegram_user_id=%s",
+                (pid, update.effective_user.id),
+            )
             row = cur.fetchone()
         if not row:
             raise RuntimeError("panel not found")
-        token_url = urljoin(row["panel_url"].rstrip('/')+'/', '/api/admins/token')
-        resp = requests.post(token_url, data={"username": new_user, "password": new_pass, "grant_type": "password"}, timeout=15)
-        if resp.status_code != 200:
-            raise RuntimeError(f"login failed: {resp.status_code} {resp.text[:150]}")
-        tok = (resp.json() or {}).get("access_token")
+        tok, err = get_admin_token(row["panel_url"], new_user, new_pass)
         if not tok:
-            raise RuntimeError("no access_token")
+            raise RuntimeError(f"login failed: {err}")
         with with_mysql_cursor() as cur:
             cur.execute("UPDATE panels SET admin_username=%s, access_token=%s WHERE id=%s AND telegram_user_id=%s",
                         (new_user, tok, pid, update.effective_user.id))
