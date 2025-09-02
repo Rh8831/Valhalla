@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
+import base64
 import requests
 
 
@@ -64,8 +65,26 @@ def get_user(panel_url: str, token: str, username: str) -> Tuple[Optional[Dict],
 
 
 def fetch_links_from_panel(panel_url: str, username: str, key: str) -> List[str]:
-    """Return list of subscription links for a user token."""
+    """Return list of subscription links for a user token.
+
+    Newer Marzban versions expose ``/v2ray`` which returns a base64 encoded
+    blob of newline separated configs.  Older versions returned plain text at
+    ``/sub/<key>/``.  Try the new endpoint first and fall back to the old one
+    for compatibility.
+    """
     try:
+        url = urljoin(panel_url.rstrip('/') + '/', f"sub/{key}/v2ray")
+        r = requests.get(url, headers={"accept": "application/json,text/plain"}, timeout=20)
+        text = r.text.strip()
+        if text:
+            try:
+                decoded = base64.b64decode(text + "===")
+                text = decoded.decode(errors="ignore")
+            except Exception:
+                pass
+            return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+        # Fallback to legacy plain-text endpoint
         url = urljoin(panel_url.rstrip('/') + '/', f"sub/{key}/")
         r = requests.get(url, headers={"accept": "application/json"}, timeout=20)
         try:
@@ -115,16 +134,30 @@ def enable_remote_user(panel_url: str, token: str, username: str) -> Tuple[bool,
 
 
 def fetch_subscription_links(sub_url: str) -> List[str]:
-    """Return links from a subscription URL."""
+    """Return links from a subscription URL.
+
+    Handles both plain-text lists and base64 encoded blobs returned by the
+    ``/v2ray`` endpoint.
+    """
     try:
         r = requests.get(sub_url, headers={"accept": "text/plain,application/json"}, timeout=20)
+        txt = r.text or ""
         if r.headers.get("content-type", "").startswith("application/json"):
-            data = r.json()
-            if isinstance(data, list):
-                return [str(x) for x in data]
-            if isinstance(data, dict) and "links" in data:
-                return [str(x) for x in data["links"]]
-        return [ln.strip() for ln in (r.text or "").splitlines() if ln.strip()]
+            try:
+                data = r.json()
+                if isinstance(data, list):
+                    return [str(x) for x in data]
+                if isinstance(data, dict) and "links" in data:
+                    return [str(x) for x in data["links"]]
+            except Exception:  # pragma: no cover - parsing errors
+                pass
+        else:
+            try:
+                decoded = base64.b64decode(txt.strip() + "===")
+                txt = decoded.decode(errors="ignore")
+            except Exception:
+                pass
+        return [ln.strip() for ln in txt.splitlines() if ln.strip()]
     except Exception:  # pragma: no cover - network errors
         return []
 
