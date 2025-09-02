@@ -11,6 +11,7 @@ Flask subscription aggregator for Marzneshin
 
 import os
 import logging
+import re
 from urllib.parse import urljoin, unquote
 
 import requests
@@ -165,13 +166,25 @@ def filter_dedupe(links):
             out.append(ss)
     return out
 
+def canonicalize_name(name: str) -> str:
+    """Normalize a config name by stripping user-specific details."""
+    try:
+        nm = unquote(name or "").strip()
+        nm = re.sub(r"\s*\d+(?:\.\d+)?\s*[KMGT]?B/\d+(?:\.\d+)?\s*[KMGT]?B", "", nm, flags=re.I)
+        nm = re.sub(r"\s*👤.*", "", nm)
+        nm = re.sub(r"\s*\([a-zA-Z0-9_-]{3,}\)", "", nm)
+        nm = re.sub(r"\s+", " ", nm)
+        return nm.strip()[:255]
+    except Exception:
+        return ""
+
 def extract_name(link: str) -> str:
     try:
         i = link.find("#")
         if i == -1:
             return ""
-        nm = unquote(link[i+1:]).strip()
-        return nm[:255]
+        nm = link[i+1:]
+        return canonicalize_name(nm)
     except Exception:
         return ""
 
@@ -181,11 +194,24 @@ def get_panel_disabled_names(panel_id: int):
             "SELECT config_name FROM panel_disabled_configs WHERE panel_id=%s",
             (int(panel_id),),
         )
-        # Normalize names to match extract_name() output (strip & percent-decode)
+        # Normalize names to match extract_name() output
         return {
-            unquote(r["config_name"]).strip()
+            cn
             for r in cur.fetchall()
-            if (r["config_name"] or "").strip()
+            for cn in [canonicalize_name(r["config_name"])]
+            if (r["config_name"] or "").strip() and cn
+        }
+
+def get_panel_disabled_nums(panel_id: int):
+    with CurCtx() as cur:
+        cur.execute(
+            "SELECT config_index FROM panel_disabled_numbers WHERE panel_id=%s",
+            (int(panel_id),),
+        )
+        return {
+            int(r["config_index"])
+            for r in cur.fetchall()
+            if isinstance(r["config_index"], (int,)) and int(r["config_index"]) > 0
         }
 
 # ---- agent-level ----
@@ -286,27 +312,33 @@ def unified_links(local_username, app_key):
     all_links = []
     if mapped:
         for l in mapped:
-            disabled = get_panel_disabled_names(l["panel_id"])
+            disabled_names = get_panel_disabled_names(l["panel_id"])
+            disabled_nums = get_panel_disabled_nums(l["panel_id"])
             links = []
             u = fetch_user(l["panel_url"], l["access_token"], l["remote_username"])
             if u and u.get("key"):
                 links = fetch_links_from_panel(
                     l["panel_url"], l["remote_username"], u["key"]
                 )
-            if disabled:
-                links = [x for x in links if (extract_name(x) or "") not in disabled]
+            if disabled_names:
+                links = [x for x in links if (extract_name(x) or "") not in disabled_names]
+            if disabled_nums:
+                links = [x for idx, x in enumerate(links, 1) if idx not in disabled_nums]
             all_links.extend(links)
     else:
         for p in list_all_panels(owner_id):
-            disabled = get_panel_disabled_names(p["id"])
+            disabled_names = get_panel_disabled_names(p["id"])
+            disabled_nums = get_panel_disabled_nums(p["id"])
             links = []
             u = fetch_user(p["panel_url"], p["access_token"], local_username)
             if u and u.get("key"):
                 links = fetch_links_from_panel(
                     p["panel_url"], local_username, u["key"]
                 )
-            if disabled:
-                links = [x for x in links if (extract_name(x) or "") not in disabled]
+            if disabled_names:
+                links = [x for x in links if (extract_name(x) or "") not in disabled_names]
+            if disabled_nums:
+                links = [x for idx, x in enumerate(links, 1) if idx not in disabled_nums]
             all_links.extend(links)
 
     uniq = filter_dedupe(all_links)
