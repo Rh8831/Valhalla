@@ -98,15 +98,23 @@ def get_user(panel_url: str, token: str, username: str) -> Tuple[Optional[Dict],
     if not client or not inbound:
         return None, 'not found'
     uuid = client.get('id') or client.get('uuid')
-    enabled = bool(client.get('enable', True))
-    used = 0
-    for st in inbound.get('clientStats', []) or []:
-        if st.get('id') == uuid:
-            up = int(st.get('up', 0) or 0)
-            down = int(st.get('down', 0) or 0)
-            used = up + down
-            break
-    obj = {
+    try:
+        r = requests.get(
+            urljoin(panel_url.rstrip('/') + '/', f"panel/api/inbounds/getClientTraffics/{username}"),
+            headers={"accept": "application/json", **get_headers(token)},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return None, f"{r.status_code} {r.text[:200]}"
+        data = r.json() or {}
+        obj = data.get('obj') or data
+        up = int(obj.get('up', 0) or 0)
+        down = int(obj.get('down', 0) or 0)
+        enabled = bool(obj.get('enable', True))
+        used = up + down
+    except Exception as e:  # pragma: no cover - network errors
+        return None, str(e)[:200]
+    res = {
         'uuid': uuid,
         'enabled': enabled,
         'used_traffic': used,
@@ -115,7 +123,7 @@ def get_user(panel_url: str, token: str, username: str) -> Tuple[Optional[Dict],
         'listen': inbound.get('listen'),
         'remark': inbound.get('remark'),
     }
-    return obj, None
+    return res, None
 
 
 def fetch_links_from_panel(panel_url: str, token: str, username: str) -> Tuple[List[str], Optional[str]]:
