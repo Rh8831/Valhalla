@@ -12,6 +12,9 @@ from dotenv import load_dotenv
 from mysql.connector import pooling
 import mysql.connector
 
+import marzneshin
+import marzban
+
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | usage_sync | %(message)s",
     level=logging.INFO,
@@ -19,6 +22,16 @@ logging.basicConfig(
 log = logging.getLogger("usage_sync")
 
 POOL = None
+
+API_MODULES = {
+    "marzneshin": marzneshin,
+    "marzban": marzban,
+}
+
+
+def get_api(panel_type: str):
+    """Return API module for the given panel type."""
+    return API_MODULES.get(panel_type or "marzneshin", marzneshin)
 
 def init_db():
     global POOL
@@ -92,7 +105,8 @@ def fetch_all_links():
                        lup.remote_username,
                        lup.last_used_traffic,
                        p.panel_url,
-                       p.access_token
+                       p.access_token,
+                       p.panel_type
                 FROM local_user_panel_links lup
                 JOIN panels p ON p.id = lup.panel_id
                 ORDER BY lup.id ASC
@@ -106,16 +120,15 @@ def fetch_all_links():
             return []
         raise
 
-def fetch_used_traffic(panel_url, bearer, remote_username):
+def fetch_used_traffic(panel_type, panel_url, bearer, remote_username):
+    """Return used traffic for a remote user via appropriate panel API."""
     try:
-        # Preserve any subpath in panel_url when joining API routes
-        url = urljoin(panel_url.rstrip("/") + "/", f"api/users/{remote_username}")
-        r = requests.get(url, headers={"Authorization": f"Bearer {bearer}"}, timeout=20)
-        if r.status_code != 200:
-            return None, f"{panel_url}: {r.status_code} {r.text[:120]}"
-        data = r.json()
-        return int(data.get("used_traffic", 0)), None
-    except Exception as e:
+        api = get_api(panel_type)
+        obj, err = api.get_user(panel_url, bearer, remote_username)
+        if not obj:
+            return None, f"{panel_url}: {err or 'user not found'}"
+        return int(obj.get("used_traffic", 0) or 0), None
+    except Exception as e:  # pragma: no cover - network errors
         return None, str(e)
 
 def add_usage(owner_id, local_username, delta):
@@ -148,7 +161,7 @@ def get_local_user(owner_id, local_username):
 def list_links_of_local_user(owner_id, local_username):
     with CurCtx() as cur:
         cur.execute("""
-            SELECT lup.panel_id, lup.remote_username, p.panel_url, p.access_token
+            SELECT lup.panel_id, lup.remote_username, p.panel_url, p.access_token, p.panel_type
             FROM local_user_panel_links lup
             JOIN panels p ON p.id = lup.panel_id
             WHERE lup.owner_id=%s AND lup.local_username=%s
@@ -163,21 +176,16 @@ def mark_user_disabled(owner_id, local_username):
             WHERE owner_id=%s AND username=%s
         """, (owner_id, local_username))
 
-def disable_remote(panel_url, token, remote_username):
-    try:
-        url = urljoin(panel_url.rstrip("/") + "/", f"api/users/{remote_username}/disable")
-        r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
-        return r.status_code, r.text[:200]
-    except Exception as e:
-        return None, str(e)
+def disable_remote(panel_type, panel_url, token, remote_username):
+    api = get_api(panel_type)
+    ok, msg = api.disable_remote_user(panel_url, token, remote_username)
+    return (200 if ok else None), msg
 
-def enable_remote(panel_url, token, remote_username):
-    try:
-        url = urljoin(panel_url.rstrip("/") + "/", f"api/users/{remote_username}/enable")
-        r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
-        return r.status_code, r.text[:200]
-    except Exception as e:
-        return None, str(e)
+
+def enable_remote(panel_type, panel_url, token, remote_username):
+    api = get_api(panel_type)
+    ok, msg = api.enable_remote_user(panel_url, token, remote_username)
+    return (200 if ok else None), msg
 
 def mark_user_enabled(owner_id, local_username):
     with CurCtx() as cur:
@@ -198,7 +206,7 @@ def try_disable_if_user_exceeded(owner_id, local_username):
     if limit > 0 and used >= limit and not pushed:
         links = list_links_of_local_user(owner_id, local_username)
         for l in links:
-            code, msg = disable_remote(l["panel_url"], l["access_token"], l["remote_username"])
+            code, msg = disable_remote(l["panel_type"], l["panel_url"], l["access_token"], l["remote_username"])
             if code and code != 200:
                 log.warning("disable on %s@%s -> %s %s", l["remote_username"], l["panel_url"], code, msg)
             else:
@@ -216,7 +224,7 @@ def try_enable_if_user_ok(owner_id, local_username):
     if pushed and (limit == 0 or used < limit):
         links = list_links_of_local_user(owner_id, local_username)
         for l in links:
-            code, msg = enable_remote(l["panel_url"], l["access_token"], l["remote_username"])
+            code, msg = enable_remote(l["panel_type"], l["panel_url"], l["access_token"], l["remote_username"])
             if code and code != 200:
                 log.warning("enable on %s@%s -> %s %s", l["remote_username"], l["panel_url"], code, msg)
             else:
@@ -255,7 +263,7 @@ def list_agent_assigned_panels(owner_id: int):
     """پنل‌هایی که به نماینده assign شده‌اند (agent_panels)."""
     with CurCtx() as cur:
         cur.execute("""
-            SELECT p.id, p.panel_url, p.access_token
+            SELECT p.id, p.panel_url, p.access_token, p.panel_type
             FROM agent_panels ap
             JOIN panels p ON p.id = ap.panel_id
             WHERE ap.agent_tg_id=%s
@@ -282,7 +290,7 @@ def disable_user_on_assigned_panels(owner_id: int, username: str):
     """اگر مپ مستقیمی نبود، روی پنل‌های assign‌شده هم با همان username دیزیبل کن."""
     panels = list_agent_assigned_panels(owner_id)
     for p in panels:
-        code, msg = disable_remote(p["panel_url"], p["access_token"], username)
+        code, msg = disable_remote(p["panel_type"], p["panel_url"], p["access_token"], username)
         if code and code != 200:
             log.warning("disable (assigned) on %s@%s -> %s %s", username, p["panel_url"], code, msg)
         else:
@@ -292,7 +300,7 @@ def enable_user_on_assigned_panels(owner_id: int, username: str):
     """اگر مپ مستقیمی نبود، روی پنل‌های assign‌شده هم با همان username فعال کن."""
     panels = list_agent_assigned_panels(owner_id)
     for p in panels:
-        code, msg = enable_remote(p["panel_url"], p["access_token"], username)
+        code, msg = enable_remote(p["panel_type"], p["panel_url"], p["access_token"], username)
         if code and code != 200:
             log.warning("enable (assigned) on %s@%s -> %s %s", username, p["panel_url"], code, msg)
         else:
@@ -352,7 +360,7 @@ def try_disable_agent_if_exceeded(owner_id: int):
             # 1) disable روی مپ‌های مستقیم کاربر
             links = list_links_of_local_user(owner_id, uname)
             for l in links:
-                code, msg = disable_remote(l["panel_url"], l["access_token"], l["remote_username"])
+                code, msg = disable_remote(l["panel_type"], l["panel_url"], l["access_token"], l["remote_username"])
                 if code and code != 200:
                     log.warning("[AGENT] disable on %s@%s -> %s %s", l["remote_username"], l["panel_url"], code, msg)
                 else:
@@ -395,7 +403,7 @@ def try_enable_agent_if_ok(owner_id: int):
         for uname in usernames:
             links = list_links_of_local_user(owner_id, uname)
             for l in links:
-                code, msg = enable_remote(l["panel_url"], l["access_token"], l["remote_username"])
+                code, msg = enable_remote(l["panel_type"], l["panel_url"], l["access_token"], l["remote_username"])
                 if code and code != 200:
                     log.warning("[AGENT] enable on %s@%s -> %s %s", l["remote_username"], l["panel_url"], code, msg)
                 else:
@@ -424,7 +432,7 @@ def loop():
             links = fetch_all_links()
             seen_owners = set()
             for row in links:
-                used, err = fetch_used_traffic(row["panel_url"], row["access_token"], row["remote_username"])
+                used, err = fetch_used_traffic(row["panel_type"], row["panel_url"], row["access_token"], row["remote_username"])
                 if used is None:
                     log.warning("fetch_used_traffic failed for %s@%s: %s",
                                 row["remote_username"], row["panel_url"], err)

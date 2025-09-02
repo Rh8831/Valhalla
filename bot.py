@@ -1602,21 +1602,29 @@ async def finalize_create_on_selected(q, context, owner_id: int, selected_ids: s
         await q.edit_message_text("❌ خطا در خواندن سرویس بعضی پنل‌ها:\n" + "\n".join(f"• {e}" for e in errs[:10]))
         return
 
-    payload_base = {
-        "username": app_username,
-        "expire_strategy": "start_on_first_use",
-        "usage_duration": usage_sec,
-        "data_limit": limit_bytes,
-        "data_limit_reset_strategy": "no_reset",
-        "note": "created_by_bot",
-    }
-
     ok, failed = 0, []
     for r in rows:
         api = get_api(r.get("panel_type"))
-        payload = {**payload_base}
         if r.get("panel_type") == "marzneshin":
-            payload["service_ids"] = per_panel.get(r["id"], [])
+            payload = {
+                "username": app_username,
+                "expire_strategy": "start_on_first_use",
+                "usage_duration": usage_sec,
+                "data_limit": limit_bytes,
+                "data_limit_reset_strategy": "no_reset",
+                "note": "created_by_bot",
+                "service_ids": per_panel.get(r["id"], []),
+            }
+        else:
+            expire_ts = 0 if usage_sec <= 0 else int(datetime.now(timezone.utc).timestamp()) + usage_sec
+            payload = {
+                "username": app_username,
+                "expire": expire_ts,
+                "data_limit": limit_bytes,
+                "data_limit_reset_strategy": "no_reset",
+                "note": "created_by_bot",
+                "inbounds": {},
+            }
         obj, e = api.create_user(r["panel_url"], r["access_token"], payload)
         if not obj:
             obj, g = api.get_user(r["panel_url"], r["access_token"], app_username)
@@ -1662,14 +1670,7 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
         usage_duration_default = 3650*86400
 
     if to_add:
-        base_payload = {
-            "username": username,
-            "expire_strategy": "start_on_first_use",
-            "usage_duration": usage_duration_default,
-            "data_limit": limit_bytes_default,
-            "data_limit_reset_strategy": "no_reset",
-            "note": "user_edit_add_panel",
-        }
+        expire_ts_default = 0 if usage_duration_default <= 0 else int(datetime.now(timezone.utc).timestamp()) + usage_duration_default
         for pid in to_add:
             p = panels_map.get(int(pid))
             if not p:
@@ -1704,7 +1705,15 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
                         added_errs.append(f"{p['panel_url']}: {e}")
                     continue
 
-                payload = {**base_payload, "service_ids": svc or []}
+                payload = {
+                    "username": username,
+                    "expire_strategy": "start_on_first_use",
+                    "usage_duration": usage_duration_default,
+                    "data_limit": limit_bytes_default,
+                    "data_limit_reset_strategy": "no_reset",
+                    "note": "user_edit_add_panel",
+                    "service_ids": svc or [],
+                }
                 obj, e2 = api.create_user(p["panel_url"], p["access_token"], payload)
                 if not obj:
                     obj, g = api.get_user(p["panel_url"], p["access_token"], username)
@@ -1722,7 +1731,14 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
             else:
                 obj, g = api.get_user(p["panel_url"], p["access_token"], username)
                 if not obj:
-                    payload = {**base_payload}
+                    payload = {
+                        "username": username,
+                        "expire": expire_ts_default,
+                        "data_limit": limit_bytes_default,
+                        "data_limit_reset_strategy": "no_reset",
+                        "note": "user_edit_add_panel",
+                        "inbounds": {},
+                    }
                     obj, e2 = api.create_user(p["panel_url"], p["access_token"], payload)
                     if not obj:
                         added_errs.append(f"{p['panel_url']}: {e2 or 'unknown error'}")
