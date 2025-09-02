@@ -13,6 +13,7 @@ import mysql.connector
 
 import marzneshin
 import marzban
+import sanaei
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | usage_sync | %(message)s",
@@ -25,6 +26,7 @@ POOL = None
 API_MODULES = {
     "marzneshin": marzneshin,
     "marzban": marzban,
+    "sanaei": sanaei,
 }
 
 
