@@ -379,15 +379,14 @@ def count_local_users(owner_id: int) -> int:
 def update_limit(owner_id: int, username: str, new_limit_bytes: int):
     with with_mysql_cursor() as cur:
         cur.execute(
-            "UPDATE local_users SET plan_limit_bytes=%s, disabled_pushed=IF(%s=0,0,disabled_pushed) "
-            "WHERE owner_id=%s AND username=%s",
-            (int(new_limit_bytes), int(new_limit_bytes), owner_id, username)
+            "UPDATE local_users SET plan_limit_bytes=%s WHERE owner_id=%s AND username=%s",
+            (int(new_limit_bytes), owner_id, username)
         )
 
 def reset_used(owner_id: int, username: str):
     with with_mysql_cursor() as cur:
         cur.execute(
-            "UPDATE local_users SET used_bytes=0, disabled_pushed=0 WHERE owner_id=%s AND username=%s",
+            "UPDATE local_users SET used_bytes=0 WHERE owner_id=%s AND username=%s",
             (owner_id, username)
         )
 
@@ -396,8 +395,7 @@ def renew_user(owner_id: int, username: str, add_days: int):
         cur.execute(
             """UPDATE local_users
                SET expire_at = IF(expire_at IS NULL, UTC_TIMESTAMP() + INTERVAL %s DAY,
-                                   expire_at + INTERVAL %s DAY),
-                   disabled_pushed = 0
+                                    expire_at + INTERVAL %s DAY)
                WHERE owner_id=%s AND username=%s""",
             (add_days, add_days, owner_id, username)
         )
@@ -526,7 +524,7 @@ def get_agent(tg_id: int):
 
 def set_agent_quota(tg_id: int, limit_bytes: int):
     with with_mysql_cursor() as cur:
-        cur.execute("UPDATE agents SET plan_limit_bytes=%s, disabled_pushed=0 WHERE telegram_user_id=%s",
+        cur.execute("UPDATE agents SET plan_limit_bytes=%s WHERE telegram_user_id=%s",
                     (int(limit_bytes), tg_id))
 
 def renew_agent_days(tg_id: int, add_days: int):
@@ -535,10 +533,10 @@ def renew_agent_days(tg_id: int, add_days: int):
         cur.execute("SELECT expire_at FROM agents WHERE telegram_user_id=%s", (tg_id,))
         row = cur.fetchone()
         if row and row.get("expire_at"):
-            cur.execute("UPDATE agents SET expire_at = expire_at + INTERVAL %s DAY, disabled_pushed=0 WHERE telegram_user_id=%s",
+            cur.execute("UPDATE agents SET expire_at = expire_at + INTERVAL %s DAY WHERE telegram_user_id=%s",
                         (add_days, tg_id))
         else:
-            cur.execute("UPDATE agents SET expire_at = UTC_TIMESTAMP() + INTERVAL %s DAY, disabled_pushed=0 WHERE telegram_user_id=%s",
+            cur.execute("UPDATE agents SET expire_at = UTC_TIMESTAMP() + INTERVAL %s DAY WHERE telegram_user_id=%s",
                         (add_days, tg_id))
 
 def list_agents():

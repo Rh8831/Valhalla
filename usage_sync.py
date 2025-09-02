@@ -163,6 +163,22 @@ def disable_remote(panel_url, token, remote_username):
     except Exception as e:
         return None, str(e)
 
+def enable_remote(panel_url, token, remote_username):
+    try:
+        url = urljoin(panel_url.rstrip("/") + "/", f"api/users/{remote_username}/enable")
+        r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
+        return r.status_code, r.text[:200]
+    except Exception as e:
+        return None, str(e)
+
+def mark_user_enabled(owner_id, local_username):
+    with CurCtx() as cur:
+        cur.execute("""
+            UPDATE local_users
+            SET disabled_pushed=0, disabled_pushed_at=NULL
+            WHERE owner_id=%s AND username=%s
+        """, (owner_id, local_username))
+
 def try_disable_if_user_exceeded(owner_id, local_username):
     lu = get_local_user(owner_id, local_username)
     if not lu:
@@ -180,6 +196,24 @@ def try_disable_if_user_exceeded(owner_id, local_username):
             else:
                 log.info("disabled %s on %s", l["remote_username"], l["panel_url"])
         mark_user_disabled(owner_id, local_username)
+
+def try_enable_if_user_ok(owner_id, local_username):
+    lu = get_local_user(owner_id, local_username)
+    if not lu:
+        return
+    limit = int(lu["plan_limit_bytes"])
+    used = int(lu["used_bytes"])
+    pushed = int(lu.get("disabled_pushed", 0) or 0)
+
+    if pushed and (limit == 0 or used < limit):
+        links = list_links_of_local_user(owner_id, local_username)
+        for l in links:
+            code, msg = enable_remote(l["panel_url"], l["access_token"], l["remote_username"])
+            if code and code != 200:
+                log.warning("enable on %s@%s -> %s %s", l["remote_username"], l["panel_url"], code, msg)
+            else:
+                log.info("enabled %s on %s", l["remote_username"], l["panel_url"])
+        mark_user_enabled(owner_id, local_username)
 
 # ---------------- NEW: Agent quota/expiry logic ----------------
 
@@ -246,6 +280,32 @@ def disable_user_on_assigned_panels(owner_id: int, username: str):
         else:
             log.info("(assigned) disabled %s on %s", username, p["panel_url"])
 
+def enable_user_on_assigned_panels(owner_id: int, username: str):
+    """اگر مپ مستقیمی نبود، روی پنل‌های assign‌شده هم با همان username فعال کن."""
+    panels = list_agent_assigned_panels(owner_id)
+    for p in panels:
+        code, msg = enable_remote(p["panel_url"], p["access_token"], username)
+        if code and code != 200:
+            log.warning("enable (assigned) on %s@%s -> %s %s", username, p["panel_url"], code, msg)
+        else:
+            log.info("(assigned) enabled %s on %s", username, p["panel_url"])
+
+def mark_agent_enabled(owner_id: int):
+    with CurCtx() as cur:
+        cur.execute("""
+            UPDATE agents
+            SET disabled_pushed=0, disabled_pushed_at=NULL
+            WHERE telegram_user_id=%s
+        """, (owner_id,))
+
+def mark_all_users_enabled(owner_id: int):
+    with CurCtx() as cur:
+        cur.execute("""
+            UPDATE local_users
+            SET disabled_pushed=0, disabled_pushed_at=NULL
+            WHERE owner_id=%s
+        """, (owner_id,))
+
 def try_disable_agent_if_exceeded(owner_id: int):
     """
     اگر نماینده limit داشته و از سقف گذشته یا expire_at گذشته و هنوز push نشده:
@@ -297,6 +357,46 @@ def try_disable_agent_if_exceeded(owner_id: int):
         mark_agent_disabled(owner_id)
         log.info("[AGENT] owner_id=%s disabled_pushed set for agent and all local users.", owner_id)
 
+def try_enable_agent_if_ok(owner_id: int):
+    ag = get_agent(owner_id)
+    if not ag:
+        return
+    if int(ag.get("active", 1)) == 0:
+        return
+    pushed = int(ag.get("disabled_pushed", 0) or 0)
+    if not pushed:
+        return
+
+    limit_b = int(ag.get("plan_limit_bytes") or 0)
+    expire_at = ag.get("expire_at")
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    expired = False
+    if expire_at:
+        try:
+            expired = (expire_at <= now_utc)
+        except Exception:
+            expired = False
+
+    over_limit = False
+    if limit_b > 0:
+        tot = total_used_by_owner(owner_id)
+        over_limit = (tot >= limit_b)
+
+    if not expired and not over_limit:
+        usernames = list_all_local_usernames(owner_id)
+        for uname in usernames:
+            links = list_links_of_local_user(owner_id, uname)
+            for l in links:
+                code, msg = enable_remote(l["panel_url"], l["access_token"], l["remote_username"])
+                if code and code != 200:
+                    log.warning("[AGENT] enable on %s@%s -> %s %s", l["remote_username"], l["panel_url"], code, msg)
+                else:
+                    log.info("[AGENT] enabled %s on %s", l["remote_username"], l["panel_url"])
+            enable_user_on_assigned_panels(owner_id, uname)
+        mark_all_users_enabled(owner_id)
+        mark_agent_enabled(owner_id)
+        log.info("[AGENT] owner_id=%s disabled_pushed cleared for agent and all local users.", owner_id)
+
 # ---------------- main loop ----------------
 
 def loop():
@@ -327,15 +427,17 @@ def loop():
                     log.info("owner=%s local=%s +%s bytes (panel_id=%s)",
                              row["owner_id"], row["local_username"], delta, row["panel_id"])
 
-                # بعد از هر آپدیت، بررسی کن که آیا باید کاربر را disable کنیم
+                # بعد از هر آپدیت، وضعیت کاربر را بررسی کن (disable/enable)
                 try_disable_if_user_exceeded(row["owner_id"], row["local_username"])
+                try_enable_if_user_ok(row["owner_id"], row["local_username"])
 
                 # برای بهینگی، در پایان هر owner یک‌بار چک agent quota انجام می‌دهیم
                 seen_owners.add(int(row["owner_id"]))
 
-            # پس از پردازش همه لینک‌ها، کوتا/انقضای نماینده‌ها را چک کن
+            # پس از پردازش همه لینک‌ها، وضعیت نماینده‌ها را چک کن
             for owner_id in seen_owners:
                 try_disable_agent_if_exceeded(owner_id)
+                try_enable_agent_if_ok(owner_id)
 
         except Exception as e:
             log.exception("sync loop error: %s", e)
