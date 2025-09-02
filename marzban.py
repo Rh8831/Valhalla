@@ -33,7 +33,7 @@ def create_user(panel_url: str, token: str, payload: Dict) -> Tuple[Optional[Dic
             headers={**get_headers(token), "Content-Type": "application/json"},
             timeout=20,
         )
-        if r.status_code == 200:
+        if r.status_code in (200, 201):
             return r.json(), None
         return None, f"{r.status_code} {r.text[:300]}"
     except Exception as e:  # pragma: no cover - network errors
