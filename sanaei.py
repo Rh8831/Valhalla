@@ -40,11 +40,11 @@ def create_user(panel_url: str, token: str, payload: Dict) -> Tuple[Optional[Dic
     The 3x-ui API requires the inbound ID and the client object.  Because
     configuration details vary widely, callers must supply the appropriate
     payload.  This helper simply forwards the payload to the
-    ``/panel/api/inbound/addClient`` endpoint.
+    ``/panel/api/inbounds/addClient`` endpoint.
     """
     try:
         r = requests.post(
-            urljoin(panel_url.rstrip('/') + '/', 'panel/api/inbound/addClient'),
+            urljoin(panel_url.rstrip('/') + '/', 'panel/api/inbounds/addClient'),
             json=payload,
             headers={**get_headers(token), 'Content-Type': 'application/json'},
             timeout=20,
