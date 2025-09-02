@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flask subscription aggregator for Marzneshin
+Flask subscription aggregator for Marzneshin and Marzban
 - GET /sub/<local_username>/<app_key>/links
 - Returns only configs (ss://, vless://, vmess://, trojan://), one per line (text/plain)
 - Enforces local quota. If user quota exceeded -> empty body + DISABLE remote (once).
 - NEW: Enforces AGENT-level quota/expiry too: if agent exhausted/expired -> empty body + DISABLE ALL agent users (once).
 - Supports per-panel disabled config-name filters (anything after '#' is the name).
+- Handles Marzban's base64 subscriptions served from /v2ray endpoints.
 """
 
 import os
 import logging
 import re
+import base64
 from urllib.parse import urljoin, unquote
 
 import requests
@@ -139,21 +141,37 @@ def fetch_user(panel_url: str, token: str, remote_username: str):
         return None
 
 def fetch_links_from_panel(panel_url: str, remote_username: str, key: str):
-    try:
-        url = urljoin(panel_url.rstrip("/") + "/", f"sub/{remote_username}/{key}/links")
-        r = requests.get(url, headers={"accept": "application/json"}, timeout=20)
+    paths = ("links", "v2ray")
+    for suffix in paths:
         try:
-            if r.headers.get("content-type","").startswith("application/json"):
-                data = r.json()
-                if isinstance(data, list):
-                    return [str(x) for x in data]
-                if isinstance(data, dict) and "links" in data:
-                    return [str(x) for x in data["links"]]
-        except:
-            pass
-        return [ln.strip() for ln in (r.text or "").splitlines() if ln.strip()]
-    except:
-        return []
+            url = urljoin(panel_url.rstrip("/") + "/", f"sub/{remote_username}/{key}/{suffix}")
+            r = requests.get(url, headers={"accept": "application/json"}, timeout=20)
+            if suffix == "links":
+                try:
+                    if r.headers.get("content-type", "").startswith("application/json"):
+                        data = r.json()
+                        if isinstance(data, list):
+                            return [str(x) for x in data]
+                        if isinstance(data, dict) and "links" in data:
+                            return [str(x) for x in data["links"]]
+                except Exception:
+                    pass
+                lines = [ln.strip() for ln in (r.text or "").splitlines() if ln.strip()]
+                if lines:
+                    return lines
+            else:
+                text = (r.text or "").strip()
+                if text:
+                    try:
+                        decoded = base64.b64decode(text).decode("utf-8", "ignore")
+                        lines = [ln.strip() for ln in decoded.splitlines() if ln.strip()]
+                        if lines:
+                            return lines
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+    return []
 
 def filter_dedupe(links):
     out, seen = [], set()
