@@ -35,7 +35,6 @@ from mysql.connector import pooling, Error as MySQLError
 
 import marzneshin
 import marzban
-from marzneshin import fetch_subscription_links
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -1092,7 +1091,7 @@ async def show_panel_cfg_selector(q, context: ContextTypes.DEFAULT_TYPE, owner_i
         if u and u.get("key"):
             links = api.fetch_links_from_panel(info["panel_url"], info["template_username"], u["key"])
     elif info.get("sub_url"):
-        links = fetch_subscription_links(info["sub_url"])
+        links = api.fetch_subscription_links(info["sub_url"])
     if not links:
         await q.edit_message_text("ابتدا template یا لینک سابسکریپشن را تنظیم کن.")
         return ConversationHandler.END
@@ -1131,7 +1130,7 @@ async def show_panel_cfgnum_selector(q, context: ContextTypes.DEFAULT_TYPE, owne
         if u and u.get("key"):
             links = api.fetch_links_from_panel(info["panel_url"], info["template_username"], u["key"])
     elif info.get("sub_url"):
-        links = fetch_subscription_links(info["sub_url"])
+        links = api.fetch_subscription_links(info["sub_url"])
     if not links:
         await q.edit_message_text("ابتدا template یا لینک سابسکریپشن را تنظیم کن.")
         return ConversationHandler.END
@@ -1592,31 +1591,63 @@ async def finalize_create_on_selected(q, context, owner_id: int, selected_ids: s
     for r in rows:
         api = get_api(r.get("panel_type"))
         if r.get("panel_type") == "marzneshin":
-            svc, e = api.fetch_user_services(r["panel_url"], r["access_token"], r.get("template_username"))
+            svc, e = api.fetch_user_services(
+                r["panel_url"], r["access_token"], r.get("template_username")
+            )
             if e:
-                errs.append(f"{r['panel_url']} (template '{r['template_username']}'): {e}")
-            per_panel[r["id"]] = svc or []
+                errs.append(
+                    f"{r['panel_url']} (template '{r['template_username']}'): {e}"
+                )
+            per_panel[r["id"]] = {"service_ids": svc or []}
         else:
-            per_panel[r["id"]] = []
+            tmpl = r.get("template_username")
+            if not tmpl:
+                errs.append(f"{r['panel_url']}: template missing")
+                per_panel[r["id"]] = {"proxies": {}, "inbounds": {}}
+                continue
+            obj, e = api.get_user(r["panel_url"], r["access_token"], tmpl)
+            if not obj:
+                errs.append(
+                    f"{r['panel_url']} (template '{tmpl}'): {e or 'not found'}"
+                )
+                per_panel[r["id"]] = {"proxies": {}, "inbounds": {}}
+                continue
+            per_panel[r["id"]] = {
+                "proxies": obj.get("proxies") or {},
+                "inbounds": obj.get("inbounds") or {},
+            }
     if errs:
-        await q.edit_message_text("❌ خطا در خواندن سرویس بعضی پنل‌ها:\n" + "\n".join(f"• {e}" for e in errs[:10]))
+        await q.edit_message_text(
+            "❌ خطا در خواندن سرویس بعضی پنل‌ها:\n" +
+            "\n".join(f"• {e}" for e in errs[:10])
+        )
         return
-
-    payload_base = {
-        "username": app_username,
-        "expire_strategy": "start_on_first_use",
-        "usage_duration": usage_sec,
-        "data_limit": limit_bytes,
-        "data_limit_reset_strategy": "no_reset",
-        "note": "created_by_bot",
-    }
 
     ok, failed = 0, []
     for r in rows:
         api = get_api(r.get("panel_type"))
-        payload = {**payload_base}
         if r.get("panel_type") == "marzneshin":
-            payload["service_ids"] = per_panel.get(r["id"], [])
+            payload = {
+                "username": app_username,
+                "expire_strategy": "start_on_first_use",
+                "usage_duration": usage_sec,
+                "data_limit": limit_bytes,
+                "data_limit_reset_strategy": "no_reset",
+                "note": "created_by_bot",
+                "service_ids": per_panel.get(r["id"], {}).get("service_ids", []),
+            }
+        else:
+            expire_ts = 0 if usage_sec <= 0 else int(datetime.now(timezone.utc).timestamp()) + usage_sec
+            tmpl_info = per_panel.get(r["id"], {})
+            payload = {
+                "username": app_username,
+                "expire": expire_ts,
+                "data_limit": limit_bytes,
+                "data_limit_reset_strategy": "no_reset",
+                "note": "created_by_bot",
+                "proxies": tmpl_info.get("proxies", {}),
+                "inbounds": tmpl_info.get("inbounds", {}),
+            }
         obj, e = api.create_user(r["panel_url"], r["access_token"], payload)
         if not obj:
             obj, g = api.get_user(r["panel_url"], r["access_token"], app_username)
@@ -1662,14 +1693,11 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
         usage_duration_default = 3650*86400
 
     if to_add:
-        base_payload = {
-            "username": username,
-            "expire_strategy": "start_on_first_use",
-            "usage_duration": usage_duration_default,
-            "data_limit": limit_bytes_default,
-            "data_limit_reset_strategy": "no_reset",
-            "note": "user_edit_add_panel",
-        }
+        expire_ts_default = (
+            0
+            if usage_duration_default <= 0
+            else int(datetime.now(timezone.utc).timestamp()) + usage_duration_default
+        )
         for pid in to_add:
             p = panels_map.get(int(pid))
             if not p:
@@ -1704,7 +1732,15 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
                         added_errs.append(f"{p['panel_url']}: {e}")
                     continue
 
-                payload = {**base_payload, "service_ids": svc or []}
+                payload = {
+                    "username": username,
+                    "expire_strategy": "start_on_first_use",
+                    "usage_duration": usage_duration_default,
+                    "data_limit": limit_bytes_default,
+                    "data_limit_reset_strategy": "no_reset",
+                    "note": "user_edit_add_panel",
+                    "service_ids": svc or [],
+                }
                 obj, e2 = api.create_user(p["panel_url"], p["access_token"], payload)
                 if not obj:
                     obj, g = api.get_user(p["panel_url"], p["access_token"], username)
@@ -1722,15 +1758,45 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
             else:
                 obj, g = api.get_user(p["panel_url"], p["access_token"], username)
                 if not obj:
-                    payload = {**base_payload}
-                    obj, e2 = api.create_user(p["panel_url"], p["access_token"], payload)
-                    if not obj:
-                        added_errs.append(f"{p['panel_url']}: {e2 or 'unknown error'}")
+                    if tmpl:
+                        tmpl_obj, t_err = api.get_user(
+                            p["panel_url"], p["access_token"], tmpl
+                        )
+                        if not tmpl_obj:
+                            added_errs.append(
+                                f"{p['panel_url']} (template '{tmpl}'): {t_err or 'not found'}"
+                            )
+                            continue
+                        payload = {
+                            "username": username,
+                            "expire": expire_ts_default,
+                            "data_limit": limit_bytes_default,
+                            "data_limit_reset_strategy": "no_reset",
+                            "note": "user_edit_add_panel",
+                            "proxies": tmpl_obj.get("proxies") or {},
+                            "inbounds": tmpl_obj.get("inbounds") or {},
+                        }
+                        obj, e2 = api.create_user(
+                            p["panel_url"], p["access_token"], payload
+                        )
+                        if not obj:
+                            added_errs.append(
+                                f"{p['panel_url']}: {e2 or 'unknown error'}"
+                            )
+                            continue
+                    else:
+                        added_errs.append(
+                            f"{p['panel_url']}: no template & user not found"
+                        )
                         continue
                 if not obj.get("enabled", True):
-                    ok_en, err_en = api.enable_remote_user(p["panel_url"], p["access_token"], username)
+                    ok_en, err_en = api.enable_remote_user(
+                        p["panel_url"], p["access_token"], username
+                    )
                     if not ok_en:
-                        added_errs.append(f"{p['panel_url']}: enable failed - {err_en or 'unknown'}")
+                        added_errs.append(
+                            f"{p['panel_url']}: enable failed - {err_en or 'unknown'}"
+                        )
                 save_link(owner_id, username, int(pid), username)
                 added_ok += 1
 

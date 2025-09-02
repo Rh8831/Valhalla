@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Flask subscription aggregator for Marzneshin
+Flask subscription aggregator for Marzneshin and Marzban
 - GET /sub/<local_username>/<app_key>/links
 - Returns only configs (ss://, vless://, vmess://, trojan://), one per line (text/plain)
 - Enforces local quota. If user quota exceeded -> empty body + DISABLE remote (once).
 - NEW: Enforces AGENT-level quota/expiry too: if agent exhausted/expired -> empty body + DISABLE ALL agent users (once).
 - Supports per-panel disabled config-name filters (anything after '#' is the name).
+- Handles Marzban's base64 subscriptions served from /v2ray endpoints.
 """
 
 import os
 import logging
 import re
+import base64
 from urllib.parse import urljoin, unquote
 
 import requests
 from flask import Flask, Response, abort
 from dotenv import load_dotenv
 from mysql.connector import pooling
+
+import marzneshin
+import marzban
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | flask_agg | %(message)s",
@@ -27,6 +32,14 @@ log = logging.getLogger("flask_agg")
 
 POOL = None
 ALLOWED_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://")
+
+API_MODULES = {
+    "marzneshin": marzneshin,
+    "marzban": marzban,
+}
+
+def get_api(panel_type: str):
+    return API_MODULES.get(panel_type or "marzneshin", marzneshin)
 
 def init_pool():
     global POOL
@@ -87,7 +100,7 @@ def list_mapped_links(owner_id, local_username):
         cur.execute(
             """
             SELECT lup.panel_id, lup.remote_username,
-                   p.panel_url, p.access_token
+                   p.panel_url, p.access_token, p.panel_type
             FROM local_user_panel_links lup
             JOIN panels p ON p.id = lup.panel_id
             WHERE lup.owner_id=%s AND lup.local_username=%s
@@ -105,7 +118,7 @@ def list_all_panels(owner_id):
     """
     with CurCtx() as cur:
         cur.execute(
-            "SELECT id, panel_url, access_token FROM panels WHERE telegram_user_id=%s",
+            "SELECT id, panel_url, access_token, panel_type FROM panels WHERE telegram_user_id=%s",
             (owner_id,),
         )
         return cur.fetchall()
@@ -118,42 +131,64 @@ def mark_user_disabled(owner_id, local_username):
             WHERE owner_id=%s AND username=%s
         """, (owner_id, local_username))
 
-def disable_remote(panel_url, token, remote_username):
+def disable_remote(panel_type, panel_url, token, remote_username):
+    api = get_api(panel_type)
     try:
-        # panel_url may already include a path component; urljoin with a leading
-        # slash would discard it. Join paths relative to preserve subpaths.
-        url = urljoin(panel_url.rstrip("/") + "/", f"api/users/{remote_username}/disable")
-        r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
-        return r.status_code, r.text[:200]
+        ok, msg = api.disable_remote_user(panel_url, token, remote_username)
+        return (200 if ok else None), msg
     except Exception as e:
         return None, str(e)
 
-def fetch_user(panel_url: str, token: str, remote_username: str):
+def fetch_user(panel_type: str, panel_url: str, token: str, remote_username: str):
+    api = get_api(panel_type)
     try:
-        url = urljoin(panel_url.rstrip("/") + "/", f"api/users/{remote_username}")
-        r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
-        if r.status_code != 200:
-            return None
-        return r.json()
-    except:
-        return None
+        obj, err = api.get_user(panel_url, token, remote_username)
+        if obj:
+            return obj
+    except Exception:
+        pass
+    return None
 
 def fetch_links_from_panel(panel_url: str, remote_username: str, key: str):
-    try:
-        url = urljoin(panel_url.rstrip("/") + "/", f"sub/{remote_username}/{key}/links")
-        r = requests.get(url, headers={"accept": "application/json"}, timeout=20)
+    """Fetch subscription configs from a panel.
+
+    Marzban panels expose base64-encoded subscriptions at the ``/v2ray``
+    endpoint only, while Marzneshin panels continue to serve plain-text lists
+    at ``/links``.  We therefore attempt ``/v2ray`` first to properly decode
+    Marzban responses and fall back to ``/links`` for Marzneshin or legacy
+    panels.
+    """
+    paths = ("v2ray", "links")
+    for suffix in paths:
         try:
-            if r.headers.get("content-type","").startswith("application/json"):
-                data = r.json()
-                if isinstance(data, list):
-                    return [str(x) for x in data]
-                if isinstance(data, dict) and "links" in data:
-                    return [str(x) for x in data["links"]]
-        except:
-            pass
-        return [ln.strip() for ln in (r.text or "").splitlines() if ln.strip()]
-    except:
-        return []
+            url = urljoin(panel_url.rstrip("/") + "/", f"sub/{remote_username}/{key}/{suffix}")
+            r = requests.get(url, headers={"accept": "application/json"}, timeout=20)
+            if suffix == "v2ray":
+                text = (r.text or "").strip()
+                if text:
+                    try:
+                        decoded = base64.b64decode(text).decode("utf-8", "ignore")
+                        lines = [ln.strip() for ln in decoded.splitlines() if ln.strip()]
+                        if lines:
+                            return lines
+                    except Exception:
+                        pass
+            else:
+                try:
+                    if r.headers.get("content-type", "").startswith("application/json"):
+                        data = r.json()
+                        if isinstance(data, list):
+                            return [str(x) for x in data]
+                        if isinstance(data, dict) and "links" in data:
+                            return [str(x) for x in data["links"]]
+                except Exception:
+                    pass
+                lines = [ln.strip() for ln in (r.text or "").splitlines() if ln.strip()]
+                if lines:
+                    return lines
+        except Exception:
+            continue
+    return []
 
 def filter_dedupe(links):
     out, seen = [], set()
@@ -233,7 +268,7 @@ def get_agent_total_used(owner_id: int) -> int:
 def list_all_agent_links(owner_id: int):
     with CurCtx() as cur:
         cur.execute("""
-            SELECT lup.local_username, lup.remote_username, p.panel_url, p.access_token
+            SELECT lup.local_username, lup.remote_username, p.panel_url, p.access_token, p.panel_type
             FROM local_user_panel_links lup
             JOIN panels p ON p.id = lup.panel_id
             WHERE lup.owner_id=%s
@@ -272,7 +307,9 @@ def unified_links(local_username, app_key):
             if not pushed_a:
                 # disable ALL users of this agent across all panels (once)
                 for l in list_all_agent_links(owner_id):
-                    code, msg = disable_remote(l["panel_url"], l["access_token"], l["remote_username"])
+                    code, msg = disable_remote(
+                        l["panel_type"], l["panel_url"], l["access_token"], l["remote_username"]
+                    )
                     if code and code != 200:
                         log.warning("AGENT disable on %s@%s -> %s %s",
                                     l["remote_username"], l["panel_url"], code, msg)
@@ -293,10 +330,20 @@ def unified_links(local_username, app_key):
             links = list_mapped_links(owner_id, local_username)
             if not links:
                 panels = list_all_panels(owner_id)
-                links = [{"panel_id": p["id"], "remote_username": local_username,
-                          "panel_url": p["panel_url"], "access_token": p["access_token"]} for p in panels]
+                links = [
+                    {
+                        "panel_id": p["id"],
+                        "remote_username": local_username,
+                        "panel_url": p["panel_url"],
+                        "access_token": p["access_token"],
+                        "panel_type": p["panel_type"],
+                    }
+                    for p in panels
+                ]
             for l in links:
-                code, msg = disable_remote(l["panel_url"], l["access_token"], l["remote_username"])
+                code, msg = disable_remote(
+                    l.get("panel_type"), l["panel_url"], l["access_token"], l["remote_username"]
+                )
                 if code and code != 200:
                     log.warning("disable on %s@%s -> %s %s", l["remote_username"], l["panel_url"], code, msg)
             mark_user_disabled(owner_id, local_username)
@@ -315,7 +362,7 @@ def unified_links(local_username, app_key):
             disabled_names = get_panel_disabled_names(l["panel_id"])
             disabled_nums = get_panel_disabled_nums(l["panel_id"])
             links = []
-            u = fetch_user(l["panel_url"], l["access_token"], l["remote_username"])
+            u = fetch_user(l.get("panel_type"), l["panel_url"], l["access_token"], l["remote_username"])
             if u and u.get("key"):
                 links = fetch_links_from_panel(
                     l["panel_url"], l["remote_username"], u["key"]
@@ -330,7 +377,7 @@ def unified_links(local_username, app_key):
             disabled_names = get_panel_disabled_names(p["id"])
             disabled_nums = get_panel_disabled_nums(p["id"])
             links = []
-            u = fetch_user(p["panel_url"], p["access_token"], local_username)
+            u = fetch_user(p.get("panel_type"), p["panel_url"], p["access_token"], local_username)
             if u and u.get("key"):
                 links = fetch_links_from_panel(
                     p["panel_url"], local_username, u["key"]

@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
+import base64
 import requests
 
 
@@ -33,7 +34,7 @@ def create_user(panel_url: str, token: str, payload: Dict) -> Tuple[Optional[Dic
             headers={**get_headers(token), "Content-Type": "application/json"},
             timeout=20,
         )
-        if r.status_code == 200:
+        if r.status_code in (200, 201):
             return r.json(), None
         return None, f"{r.status_code} {r.text[:300]}"
     except Exception as e:  # pragma: no cover - network errors
@@ -64,22 +65,28 @@ def get_user(panel_url: str, token: str, username: str) -> Tuple[Optional[Dict],
 
 
 def fetch_links_from_panel(panel_url: str, username: str, key: str) -> List[str]:
-    """Return list of subscription links for a user token."""
+    """Return list of subscription links for a user token.
+
+    Marzban serves subscriptions as base64 strings via the ``/v2ray`` path, so
+    we attempt to fetch that endpoint and decode the contents.  No other format
+    is currently supported, but the function gracefully returns an empty list on
+    failure.
+    """
     try:
-        url = urljoin(panel_url.rstrip('/') + '/', f"sub/{key}/")
+        url = urljoin(
+            panel_url.rstrip('/') + '/', f"sub/{username}/{key}/v2ray"
+        )
         r = requests.get(url, headers={"accept": "application/json"}, timeout=20)
-        try:
-            if r.headers.get("content-type", "").startswith("application/json"):
-                data = r.json()
-                if isinstance(data, list):
-                    return [str(x) for x in data]
-                if isinstance(data, dict) and "links" in data:
-                    return [str(x) for x in data["links"]]
-        except Exception:  # pragma: no cover - parsing errors
-            pass
-        return [ln.strip() for ln in (r.text or "").splitlines() if ln.strip()]
+        text = (r.text or "").strip()
+        if text:
+            try:
+                decoded = base64.b64decode(text).decode("utf-8", "ignore")
+                return [ln.strip() for ln in decoded.splitlines() if ln.strip()]
+            except Exception:
+                pass
     except Exception:  # pragma: no cover - network errors
-        return []
+        pass
+    return []
 
 
 def disable_remote_user(panel_url: str, token: str, username: str) -> Tuple[bool, Optional[str]]:
@@ -115,16 +122,28 @@ def enable_remote_user(panel_url: str, token: str, username: str) -> Tuple[bool,
 
 
 def fetch_subscription_links(sub_url: str) -> List[str]:
-    """Return links from a subscription URL."""
+    """Return links from a subscription URL.
+
+    Marzban subscriptions returned from ``/v2ray`` endpoints are base64
+    encoded.  We first attempt to decode the body as base64 and fall back to
+    treating it as plain text if decoding fails.
+    """
     try:
         r = requests.get(sub_url, headers={"accept": "text/plain,application/json"}, timeout=20)
+        text = (r.text or "").strip()
         if r.headers.get("content-type", "").startswith("application/json"):
             data = r.json()
             if isinstance(data, list):
                 return [str(x) for x in data]
             if isinstance(data, dict) and "links" in data:
                 return [str(x) for x in data["links"]]
-        return [ln.strip() for ln in (r.text or "").splitlines() if ln.strip()]
+        if text:
+            try:
+                decoded = base64.b64decode(text).decode("utf-8", "ignore")
+                return [ln.strip() for ln in decoded.splitlines() if ln.strip()]
+            except Exception:
+                pass
+        return [ln.strip() for ln in text.splitlines() if ln.strip()]
     except Exception:  # pragma: no cover - network errors
         return []
 
