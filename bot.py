@@ -27,6 +27,8 @@ import os
 import logging
 import secrets
 import re
+import json
+import uuid
 from urllib.parse import urlparse, unquote
 from datetime import datetime, timedelta, timezone
 
@@ -35,6 +37,7 @@ from mysql.connector import pooling, Error as MySQLError
 
 import marzneshin
 import marzban
+import sanaei
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -55,6 +58,7 @@ log = logging.getLogger("marz_bot")
 API_MODULES = {
     "marzneshin": marzneshin,
     "marzban": marzban,
+    "sanaei": sanaei,
 }
 
 def get_api(panel_type: str):
@@ -638,9 +642,12 @@ async def show_panel_select(update_or_q, context, owner_id: int, mode: str, user
         return ConversationHandler.END
 
     if mode == "create":
-        panels = [p for p in panels if p.get("template_username")]
+        panels = [
+            p for p in panels
+            if not ((p.get("panel_type") in ("marzneshin", "sanaei")) and not p.get("template_username"))
+        ]
         if not panels:
-            txt = "⚠️ هیچ پنلی template ندارد. از 🛠️ Manage Panels تنظیم کن."
+            txt = "⚠️ هیچ پنلی template/inbound ندارد. از 🛠️ Manage Panels تنظیم کن."
             if hasattr(update_or_q, "edit_message_text"):
                 await update_or_q.edit_message_text(txt)
             else:
@@ -705,7 +712,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "p_set_template":
         if not is_admin(uid): return ConversationHandler.END
-        await q.edit_message_text("نام تمپلیت را بفرست (برای حذف، '-'):") ; return ASK_PANEL_TEMPLATE
+        pid = context.user_data.get("edit_panel_id")
+        info = get_panel(uid, pid) if pid else None
+        prompt = (
+            "ID اینباند(ها) را با ویرگول جدا کن"
+            if info and info.get("panel_type") == "sanaei"
+            else "نام تمپلیت"
+        )
+        await q.edit_message_text(f"{prompt} را بفرست (برای حذف، '-'):") ; return ASK_PANEL_TEMPLATE
     if data == "p_rename":
         if not is_admin(uid): return ConversationHandler.END
         await q.edit_message_text("اسم جدید پنل را بفرست:") ; return ASK_EDIT_PANEL_NAME
@@ -713,25 +727,43 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(uid): return ConversationHandler.END
         await q.edit_message_text("یوزرنیم ادمین جدید را بفرست:") ; return ASK_EDIT_PANEL_USER
     if data == "p_set_sub":
-        if not is_admin(uid): return ConversationHandler.END
-        await q.edit_message_text("لینک سابسکریپشن پنل را بفرست (برای حذف، '-'):") ; return ASK_PANEL_SUB_URL
-    if data == "p_filter_cfgs":
-        if not is_admin(uid): return ConversationHandler.END
+        if not is_admin(uid):
+            return ConversationHandler.END
         pid = context.user_data.get("edit_panel_id")
         info = get_panel(uid, pid)
         if not info:
             await q.edit_message_text("پنل پیدا نشد.")
+            return ConversationHandler.END
+        if info.get("panel_type") == "sanaei":
+            await q.edit_message_text("این قابلیت برای پنل‌های 3x-ui در دسترس نیست.")
+            return ConversationHandler.END
+        await q.edit_message_text("لینک سابسکریپشن پنل را بفرست (برای حذف، '-'):")
+        return ASK_PANEL_SUB_URL
+    if data == "p_filter_cfgs":
+        if not is_admin(uid):
+            return ConversationHandler.END
+        pid = context.user_data.get("edit_panel_id")
+        info = get_panel(uid, pid)
+        if not info:
+            await q.edit_message_text("پنل پیدا نشد.")
+            return ConversationHandler.END
+        if info.get("panel_type") == "sanaei":
+            await q.edit_message_text("فیلتر کانفیگ برای پنل‌های 3x-ui پشتیبانی نمی‌شود.")
             return ConversationHandler.END
         if not info.get("sub_url"):
             await q.edit_message_text("اول لینک سابسکریپشن پنل را تنظیم کن (Set/Clear Sub URL).")
             return ConversationHandler.END
         return await show_panel_cfg_selector(q, context, uid, pid, page=0)
     if data == "p_filter_cfgnums":
-        if not is_admin(uid): return ConversationHandler.END
+        if not is_admin(uid):
+            return ConversationHandler.END
         pid = context.user_data.get("edit_panel_id")
         info = get_panel(uid, pid)
         if not info:
             await q.edit_message_text("پنل پیدا نشد.")
+            return ConversationHandler.END
+        if info.get("panel_type") == "sanaei":
+            await q.edit_message_text("فیلتر کانفیگ برای پنل‌های 3x-ui پشتیبانی نمی‌شود.")
             return ConversationHandler.END
         if not info.get("sub_url"):
             await q.edit_message_text("اول لینک سابسکریپشن پنل را تنظیم کن (Set/Clear Sub URL).")
@@ -1157,26 +1189,34 @@ async def show_panel_card(q, context: ContextTypes.DEFAULT_TYPE, owner_id: int, 
         await q.edit_message_text("پنل پیدا نشد.")
         return ConversationHandler.END
 
+    is_sanaei = p.get('panel_type') == 'sanaei'
+    label = "Inbound" if is_sanaei else "Template"
     lines = [
         f"🧩 <b>{p['name']}</b>",
         f"📦 Type: <b>{p.get('panel_type', 'marzneshin')}</b>",
         f"🌐 URL: <code>{p['panel_url']}</code>",
         f"👤 Admin: <code>{p['admin_username']}</code>",
-        f"🧬 Template: <b>{p.get('template_username') or '-'}</b>",
-        f"🔗 Sub URL: <code>{p.get('sub_url') or '-'}</code>",
-        "",
-        "چه کاری انجام بدهم؟",
+        f"🧬 {label}: <b>{p.get('template_username') or '-'}</b>",
     ]
+    if not is_sanaei:
+        lines.append(f"🔗 Sub URL: <code>{p.get('sub_url') or '-'}</code>")
+    lines.extend(["", "چه کاری انجام بدهم؟"])
+
     kb = [
-        [InlineKeyboardButton("🧬 Set/Clear Template", callback_data="p_set_template")],
+        [InlineKeyboardButton(f"🧬 Set/Clear {label}", callback_data="p_set_template")],
         [InlineKeyboardButton("🔑 Change Admin Credentials", callback_data="p_change_creds")],
         [InlineKeyboardButton("✏️ Rename Panel", callback_data="p_rename")],
-        [InlineKeyboardButton("🔗 Set/Clear Sub URL", callback_data="p_set_sub")],
-        [InlineKeyboardButton("🧷 فیلتر کانفیگ‌های پنل", callback_data="p_filter_cfgs")],
-        [InlineKeyboardButton("🔢 فیلتر بر اساس شماره", callback_data="p_filter_cfgnums")],
+    ]
+    if not is_sanaei:
+        kb.extend([
+            [InlineKeyboardButton("🔗 Set/Clear Sub URL", callback_data="p_set_sub")],
+            [InlineKeyboardButton("🧷 فیلتر کانفیگ‌های پنل", callback_data="p_filter_cfgs")],
+            [InlineKeyboardButton("🔢 فیلتر بر اساس شماره", callback_data="p_filter_cfgnums")],
+        ])
+    kb.extend([
         [InlineKeyboardButton("🗑️ Remove Panel", callback_data="p_remove")],
         [InlineKeyboardButton("⬅️ Back", callback_data="manage_panels")],
-    ]
+    ])
     await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     return ConversationHandler.END
 
@@ -1268,15 +1308,15 @@ async def got_panel_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ اسم معتبر بفرست:")
         return ASK_PANEL_NAME
     context.user_data["panel_name"] = name
-    await update.message.reply_text("نوع پنل را مشخص کن (marzneshin/marzban):")
+    await update.message.reply_text("نوع پنل را مشخص کن (marzneshin/marzban/sanaei):")
     return ASK_PANEL_TYPE
 
 async def got_panel_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     t = (update.message.text or "").strip().lower()
-    if t not in ("marzneshin", "marzban"):
-        await update.message.reply_text("❌ نوع پنل نامعتبر. marzneshin یا marzban بفرست:")
+    if t not in ("marzneshin", "marzban", "sanaei"):
+        await update.message.reply_text("❌ نوع پنل نامعتبر. یکی از marzneshin/marzban/sanaei بفرست:")
         return ASK_PANEL_TYPE
     context.user_data["panel_type"] = t
     await update.message.reply_text("🌐 URL پنل (مثال https://panel.example.com):")
@@ -1344,7 +1384,10 @@ async def got_panel_template(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ پنل انتخاب نشده.")
         return ConversationHandler.END
     txt = (update.message.text or "").strip()
-    val = None if txt == "-" else txt
+    if txt == "-":
+        val = None
+    else:
+        val = ",".join(x.strip() for x in txt.split(",") if x.strip())
     try:
         with with_mysql_cursor() as cur:
             cur.execute("UPDATE panels SET template_username=%s WHERE id=%s AND telegram_user_id=%s",
@@ -1582,9 +1625,15 @@ async def finalize_create_on_selected(q, context, owner_id: int, selected_ids: s
 
     panels = list_panels_for_agent(owner_id) if not is_admin(owner_id) else list_my_panels_admin(owner_id)
     rows = [p for p in panels if int(p["id"]) in selected_ids]
-    missing = [f"{r['name']}" for r in rows if r.get("panel_type") == "marzneshin" and not r.get("template_username")]
+    missing = [
+        f"{r['name']}"
+        for r in rows
+        if (r.get("panel_type") in ("marzneshin", "sanaei")) and not r.get("template_username")
+    ]
     if missing:
-        await q.edit_message_text("⚠️ این پنل‌ها template ندارند:\n" + "\n".join(f"• {m}" for m in missing))
+        await q.edit_message_text(
+            "⚠️ این پنل‌ها template/inbound ندارند:\n" + "\n".join(f"• {m}" for m in missing)
+        )
         return
 
     per_panel, errs = {}, []
@@ -1599,6 +1648,13 @@ async def finalize_create_on_selected(q, context, owner_id: int, selected_ids: s
                     f"{r['panel_url']} (template '{r['template_username']}'): {e}"
                 )
             per_panel[r["id"]] = {"service_ids": svc or []}
+        elif r.get("panel_type") == "sanaei":
+            inbound_ids = [
+                x.strip()
+                for x in str(r.get("template_username") or "").split(",")
+                if x.strip()
+            ]
+            per_panel[r["id"]] = {"inbound_ids": inbound_ids}
         else:
             tmpl = r.get("template_username")
             if not tmpl:
@@ -1636,6 +1692,49 @@ async def finalize_create_on_selected(q, context, owner_id: int, selected_ids: s
                 "note": "created_by_bot",
                 "service_ids": per_panel.get(r["id"], {}).get("service_ids", []),
             }
+        elif r.get("panel_type") == "sanaei":
+            expire_ts = 0 if usage_sec <= 0 else int(datetime.now(timezone.utc).timestamp()) + usage_sec
+            inbound_ids = per_panel.get(r["id"], {}).get("inbound_ids", [])
+            errs_panel = []
+            success_any = False
+            for inb in inbound_ids:
+                client = {
+                    "id": str(uuid.uuid4()),
+                    "email": app_username,
+                    "enable": True,
+                }
+                if limit_bytes > 0:
+                    client["totalGB"] = limit_bytes
+                if expire_ts > 0:
+                    client["expiryTime"] = expire_ts * 1000
+                payload = {
+                    "id": int(inb),
+                    "settings": json.dumps({"clients": [client]}, separators=(",", ":")),
+                }
+                obj, e = api.create_user(r["panel_url"], r["access_token"], payload)
+                if not obj:
+                    obj2, g = api.get_user(
+                        r["panel_url"], r["access_token"], app_username
+                    )
+                    inbound_list = obj2.get("inbound_ids", []) if obj2 else []
+                    if int(inb) not in inbound_list:
+                        errs_panel.append(
+                            f"inbound {inb}: {e or g or 'unknown error'}"
+                        )
+                        continue
+                success_any = True
+            if not success_any:
+                failed.append(f"{r['panel_url']}: " + "; ".join(errs_panel[:3]))
+                continue
+            ok_en, err_en = api.enable_remote_user(r["panel_url"], r["access_token"], app_username)
+            if not ok_en:
+                failed.append(f"{r['panel_url']}: enable failed - {err_en or 'unknown'}")
+            save_link(owner_id, app_username, r["id"], app_username)
+            ok += 1
+            if errs_panel:
+                for er in errs_panel:
+                    failed.append(f"{r['panel_url']}: {er}")
+            continue
         else:
             expire_ts = 0 if usage_sec <= 0 else int(datetime.now(timezone.utc).timestamp()) + usage_sec
             tmpl_info = per_panel.get(r["id"], {})
@@ -1753,6 +1852,87 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
                     if not ok_en:
                         added_errs.append(f"{p['panel_url']}: enable failed - {err_en or 'unknown'}")
 
+                save_link(owner_id, username, int(pid), username)
+                added_ok += 1
+            elif p.get("panel_type") == "sanaei":
+                inbound_ids = [
+                    x.strip()
+                    for x in str(tmpl or "").split(",")
+                    if x.strip()
+                ]
+                obj, g = api.get_user(p["panel_url"], p["access_token"], username)
+                existing_inb = set(obj.get("inbound_ids", [])) if obj else set()
+                if not obj:
+                    if not inbound_ids:
+                        added_errs.append(f"{p['panel_url']}: inbound missing & user not found")
+                        continue
+                    errs_local = []
+                    success_any = False
+                    for inb in inbound_ids:
+                        client = {
+                            "id": str(uuid.uuid4()),
+                            "email": username,
+                            "enable": True,
+                        }
+                        if limit_bytes_default > 0:
+                            client["totalGB"] = limit_bytes_default
+                        if expire_ts_default > 0:
+                            client["expiryTime"] = expire_ts_default * 1000
+                        payload = {
+                            "id": int(inb),
+                            "settings": json.dumps({"clients": [client]}, separators=(",", ":")),
+                        }
+                        obj2, e2 = api.create_user(p["panel_url"], p["access_token"], payload)
+                        if not obj2:
+                            obj_tmp, g = api.get_user(
+                                p["panel_url"], p["access_token"], username
+                            )
+                            inbound_list = obj_tmp.get("inbound_ids", []) if obj_tmp else []
+                            if int(inb) not in inbound_list:
+                                errs_local.append(
+                                    f"inbound {inb}: {e2 or g or 'unknown error'}"
+                                )
+                                continue
+                        success_any = True
+                    if not success_any:
+                        added_errs.append(
+                            f"{p['panel_url']}: " + "; ".join(errs_local[:3])
+                        )
+                        continue
+                else:
+                    missing = [inb for inb in inbound_ids if int(inb) not in existing_inb]
+                    errs_local = []
+                    for inb in missing:
+                        client = {
+                            "id": str(uuid.uuid4()),
+                            "email": username,
+                            "enable": True,
+                        }
+                        if limit_bytes_default > 0:
+                            client["totalGB"] = limit_bytes_default
+                        if expire_ts_default > 0:
+                            client["expiryTime"] = expire_ts_default * 1000
+                        payload = {
+                            "id": int(inb),
+                            "settings": json.dumps({"clients": [client]}, separators=(",", ":")),
+                        }
+                        obj2, e2 = api.create_user(p["panel_url"], p["access_token"], payload)
+                        if not obj2:
+                            obj_tmp, g = api.get_user(
+                                p["panel_url"], p["access_token"], username
+                            )
+                            inbound_list = obj_tmp.get("inbound_ids", []) if obj_tmp else []
+                            if int(inb) not in inbound_list:
+                                errs_local.append(
+                                    f"inbound {inb}: {e2 or g or 'unknown error'}"
+                                )
+                    if errs_local:
+                        added_errs.extend(
+                            f"{p['panel_url']}: {er}" for er in errs_local
+                        )
+                ok_en, err_en = api.enable_remote_user(p["panel_url"], p["access_token"], username)
+                if not ok_en:
+                    added_errs.append(f"{p['panel_url']}: enable failed - {err_en or 'unknown'}")
                 save_link(owner_id, username, int(pid), username)
                 added_ok += 1
             else:
