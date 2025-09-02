@@ -35,6 +35,7 @@ from mysql.connector import pooling, Error as MySQLError
 
 import marzneshin
 import marzban
+import sanaei
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -55,6 +56,7 @@ log = logging.getLogger("marz_bot")
 API_MODULES = {
     "marzneshin": marzneshin,
     "marzban": marzban,
+    "sanaei": sanaei,
 }
 
 def get_api(panel_type: str):
