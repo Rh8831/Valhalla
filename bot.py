@@ -724,6 +724,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("یوزرنیم ادمین جدید را بفرست:") ; return ASK_EDIT_PANEL_USER
     if data == "p_set_sub":
         if not is_admin(uid): return ConversationHandler.END
+        pid = context.user_data.get("edit_panel_id")
+        info = get_panel(uid, pid) if pid else None
+        if info and info.get("panel_type") == "sanaei":
+            await q.edit_message_text("این پنل از لینک سابسکریپشن پشتیبانی نمی‌کند.")
+            return ConversationHandler.END
         await q.edit_message_text("لینک سابسکریپشن پنل را بفرست (برای حذف، '-'):") ; return ASK_PANEL_SUB_URL
     if data == "p_filter_cfgs":
         if not is_admin(uid): return ConversationHandler.END
@@ -731,6 +736,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = get_panel(uid, pid)
         if not info:
             await q.edit_message_text("پنل پیدا نشد.")
+            return ConversationHandler.END
+        if info.get("panel_type") == "sanaei":
+            await q.edit_message_text("این پنل از فیلتر کانفیگ‌ها پشتیبانی نمی‌کند.")
             return ConversationHandler.END
         if not info.get("sub_url"):
             await q.edit_message_text("اول لینک سابسکریپشن پنل را تنظیم کن (Set/Clear Sub URL).")
@@ -742,6 +750,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = get_panel(uid, pid)
         if not info:
             await q.edit_message_text("پنل پیدا نشد.")
+            return ConversationHandler.END
+        if info.get("panel_type") == "sanaei":
+            await q.edit_message_text("این پنل از فیلتر کانفیگ‌ها پشتیبانی نمی‌کند.")
             return ConversationHandler.END
         if not info.get("sub_url"):
             await q.edit_message_text("اول لینک سابسکریپشن پنل را تنظیم کن (Set/Clear Sub URL).")
@@ -1175,7 +1186,10 @@ async def show_panel_card(q, context: ContextTypes.DEFAULT_TYPE, owner_id: int, 
         f"🌐 URL: <code>{p['panel_url']}</code>",
         f"👤 Admin: <code>{p['admin_username']}</code>",
         f"🧬 {label}: <b>{p.get('template_username') or '-'}</b>",
-        f"🔗 Sub URL: <code>{p.get('sub_url') or '-'}</code>",
+    ]
+    if not is_sanaei:
+        lines.append(f"🔗 Sub URL: <code>{p.get('sub_url') or '-'}</code>")
+    lines += [
         "",
         "چه کاری انجام بدهم؟",
     ]
@@ -1183,12 +1197,13 @@ async def show_panel_card(q, context: ContextTypes.DEFAULT_TYPE, owner_id: int, 
         [InlineKeyboardButton(f"🧬 Set/Clear {label}", callback_data="p_set_template")],
         [InlineKeyboardButton("🔑 Change Admin Credentials", callback_data="p_change_creds")],
         [InlineKeyboardButton("✏️ Rename Panel", callback_data="p_rename")],
-        [InlineKeyboardButton("🔗 Set/Clear Sub URL", callback_data="p_set_sub")],
-        [InlineKeyboardButton("🧷 فیلتر کانفیگ‌های پنل", callback_data="p_filter_cfgs")],
-        [InlineKeyboardButton("🔢 فیلتر بر اساس شماره", callback_data="p_filter_cfgnums")],
-        [InlineKeyboardButton("🗑️ Remove Panel", callback_data="p_remove")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="manage_panels")],
     ]
+    if not is_sanaei:
+        kb.append([InlineKeyboardButton("🔗 Set/Clear Sub URL", callback_data="p_set_sub")])
+        kb.append([InlineKeyboardButton("🧷 فیلتر کانفیگ‌های پنل", callback_data="p_filter_cfgs")])
+        kb.append([InlineKeyboardButton("🔢 فیلتر بر اساس شماره", callback_data="p_filter_cfgnums")])
+    kb.append([InlineKeyboardButton("🗑️ Remove Panel", callback_data="p_remove")])
+    kb.append([InlineKeyboardButton("⬅️ Back", callback_data="manage_panels")])
     await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     return ConversationHandler.END
 
@@ -1335,9 +1350,12 @@ async def got_panel_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "INSERT INTO panels(telegram_user_id,panel_url,name,panel_type,admin_username,access_token)VALUES(%s,%s,%s,%s,%s,%s)",
                 (update.effective_user.id, panel_url, panel_name, panel_type, panel_user, tok)
             )
-        await update.message.reply_text(
-            f"✅ پنل اضافه شد: {panel_name}\nنکته: از 🛠️ Manage Panels می‌تونی Template و Sub URL را ست کنی."
-        )
+        msg = f"✅ پنل اضافه شد: {panel_name}"
+        if panel_type == "sanaei":
+            msg += "\nنکته: از 🛠️ Manage Panels می‌تونی Inbound ID را ست کنی."
+        else:
+            msg += "\nنکته: از 🛠️ Manage Panels می‌تونی Template و Sub URL را ست کنی."
+        await update.message.reply_text(msg)
     except MySQLError as e:
         await update.message.reply_text(f"❌ خطای DB: {e}")
     except Exception as e:
