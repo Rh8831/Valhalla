@@ -50,6 +50,8 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters
 )
 
+import usage_sync
+
 # ---------- logging ----------
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -526,6 +528,10 @@ def set_agent_quota(tg_id: int, limit_bytes: int):
     with with_mysql_cursor() as cur:
         cur.execute("UPDATE agents SET plan_limit_bytes=%s WHERE telegram_user_id=%s",
                     (int(limit_bytes), tg_id))
+    try:
+        usage_sync.sync_agent_now(tg_id)
+    except Exception as e:
+        log.warning("sync_agent_now failed for %s: %s", tg_id, e)
 
 def renew_agent_days(tg_id: int, add_days: int):
     # if no expire_at -> set now + days; else add days
