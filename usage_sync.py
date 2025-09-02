@@ -34,6 +34,14 @@ def init_db():
         use_pure=True,
     )
 
+
+def init_if_needed():
+    """Initialize DB pool if not already initialized."""
+    global POOL
+    if POOL is None:
+        load_dotenv()
+        init_db()
+
 class CurCtx:
     def __init__(self, dict_=True):
         self.dict_ = dict_
@@ -396,6 +404,16 @@ def try_enable_agent_if_ok(owner_id: int):
         mark_all_users_enabled(owner_id)
         mark_agent_enabled(owner_id)
         log.info("[AGENT] owner_id=%s disabled_pushed cleared for agent and all local users.", owner_id)
+
+
+def sync_agent_now(owner_id: int):
+    """Public helper for bot to immediately re-check agent status."""
+    init_if_needed()
+    try:
+        try_disable_agent_if_exceeded(owner_id)
+        try_enable_agent_if_ok(owner_id)
+    except Exception as e:
+        log.warning("sync_agent_now failed for %s: %s", owner_id, e)
 
 # ---------------- main loop ----------------
 
