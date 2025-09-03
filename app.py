@@ -16,7 +16,9 @@ from urllib.parse import urljoin, unquote
 
 import base64
 import requests
-from flask import Flask, Response, abort
+from flask import Flask, Response, abort, request, render_template_string
+from types import SimpleNamespace
+from datetime import datetime
 from dotenv import load_dotenv
 from mysql.connector import pooling
 import sanaei
@@ -29,6 +31,9 @@ log = logging.getLogger("flask_agg")
 
 POOL = None
 ALLOWED_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://")
+
+with open(os.path.join(os.path.dirname(__file__), "index.html"), encoding="utf-8") as f:
+    HTML_TEMPLATE = f.read()
 
 def init_pool():
     global POOL
@@ -317,44 +322,116 @@ def mark_agent_disabled(owner_id: int):
 # ---------- app ----------
 app = Flask(__name__)
 
+
+def bytesformat(num):
+    try:
+        num = float(num)
+    except (TypeError, ValueError):
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    for u in units:
+        if abs(num) < 1024.0:
+            return f"{num:.2f} {u}"
+        num /= 1024.0
+    return f"{num:.2f} PB"
+
+
+app.jinja_env.filters["bytesformat"] = bytesformat
+
+
+def build_user(local_username, app_key, lu, remote=None):
+    limit = int(lu.get("plan_limit_bytes") or 0) if lu else 0
+    used = int(lu.get("used_bytes") or 0) if lu else 0
+    expire_raw = ""
+    enabled = True
+    if remote:
+        enabled = remote.get("enabled", True)
+        expire_raw = (
+            remote.get("expire_date")
+            or remote.get("expire")
+            or remote.get("expiryTime")
+            or remote.get("expiry_time")
+            or remote.get("expire_at")
+            or ""
+        )
+    data_limit_reached = bool(limit > 0 and used >= limit)
+    expired = False
+    try:
+        if expire_raw:
+            if isinstance(expire_raw, str) and not expire_raw.isdigit():
+                exp_ts = datetime.fromisoformat(expire_raw).timestamp()
+            else:
+                exp_ts = float(expire_raw)
+            if exp_ts > 1e12:
+                exp_ts /= 1000.0
+            if exp_ts > 0:
+                expired = exp_ts <= datetime.utcnow().timestamp()
+                expire_raw = str(int(exp_ts))
+            else:
+                expire_raw = ""
+    except Exception:
+        expired = False
+        expire_raw = ""
+    user = {
+        "username": local_username,
+        "subscription_url": f"/sub/{local_username}/{app_key}/links",
+        "used_traffic": used,
+        "data_limit": limit or None,
+        "expire_date": expire_raw,
+        "data_limit_reset_strategy": SimpleNamespace(value="no_reset"),
+        "enabled": enabled,
+        "expired": expired,
+        "data_limit_reached": data_limit_reached,
+    }
+    user["is_active"] = user["enabled"] and not user["expired"] and not user["data_limit_reached"]
+    return user
+
 @app.route("/sub/<local_username>/<app_key>/links", methods=["GET"])
 def unified_links(local_username, app_key):
     owner_id = get_owner_id(local_username, app_key)
     if not owner_id:
         abort(404)
 
+    want_html = "text/html" in request.headers.get("Accept", "")
+
+    lu = get_local_user(owner_id, local_username)
+    if not lu:
+        if want_html:
+            user = build_user(local_username, app_key, {})
+            return render_template_string(HTML_TEMPLATE, user=user)
+        return Response("", mimetype="text/plain")
+
     # ---- Agent-level quota/expiry enforcement (global gate) ----
     ag = get_agent(owner_id)
+    agent_blocked = False
     if ag:
         limit_b = int(ag.get("plan_limit_bytes") or 0)
         exp = ag.get("expire_at")
         pushed_a = int(ag.get("disabled_pushed", 0) or 0)
-        expired = bool(exp and exp <= __import__("datetime").datetime.utcnow())
+        expired = bool(exp and exp <= datetime.utcnow())
         exceeded = False
         if limit_b > 0:
             used_total = get_agent_total_used(owner_id)
             exceeded = used_total >= limit_b
         if expired or exceeded:
+            agent_blocked = True
             if not pushed_a:
-                # disable ALL users of this agent across all panels (once)
                 for l in list_all_agent_links(owner_id):
                     code, msg = disable_remote(l["panel_type"], l["panel_url"], l["access_token"], l["remote_username"])
                     if code and code != 200:
                         log.warning("AGENT disable on %s@%s -> %s %s",
                                     l["remote_username"], l["panel_url"], code, msg)
                 mark_agent_disabled(owner_id)
-            return Response("", mimetype="text/plain")
+            if not want_html:
+                return Response("", mimetype="text/plain")
 
     # ---- User-level quota enforcement ----
-    lu = get_local_user(owner_id, local_username)
-    if not lu:
-        return Response("", mimetype="text/plain")
-
     limit = int(lu["plan_limit_bytes"])
-    used  = int(lu["used_bytes"])
+    used = int(lu["used_bytes"])
     pushed = int(lu.get("disabled_pushed", 0) or 0)
-
+    limit_reached = False
     if limit > 0 and used >= limit:
+        limit_reached = True
         if not pushed:
             links = list_mapped_links(owner_id, local_username)
             if not links:
@@ -367,74 +444,93 @@ def unified_links(local_username, app_key):
                 if code and code != 200:
                     log.warning("disable on %s@%s -> %s %s", l["remote_username"], l["panel_url"], code, msg)
             mark_user_disabled(owner_id, local_username)
-        resp = Response("", mimetype="text/plain")
-        resp.headers["X-Plan-Limit-Bytes"] = str(limit)
-        resp.headers["X-Used-Bytes"] = str(used)
-        resp.headers["X-Remaining-Bytes"] = "0"
-        resp.headers["X-Disabled-Pushed"] = "1"
-        return resp
+        if not want_html:
+            resp = Response("", mimetype="text/plain")
+            resp.headers["X-Plan-Limit-Bytes"] = str(limit)
+            resp.headers["X-Used-Bytes"] = str(used)
+            resp.headers["X-Remaining-Bytes"] = "0"
+            resp.headers["X-Disabled-Pushed"] = "1"
+            return resp
 
     # ---- Aggregate & filter links (per-panel config-name filters) ----
     mapped = list_mapped_links(owner_id, local_username)
     all_links, errors = [], []
-    if mapped:
-        for l in mapped:
-            disabled_names = get_panel_disabled_names(l["panel_id"])
-            disabled_nums = get_panel_disabled_nums(l["panel_id"])
-            links = []
-            if l.get("panel_type") == "sanaei":
-                remotes = [r.strip() for r in l["remote_username"].split(",") if r.strip()]
-                for rn in remotes:
-                    ls, err = sanaei.fetch_links_from_panel(
-                        l["panel_url"], l["access_token"], rn
-                    )
-                    if err:
-                        log.warning("fetch %s@%s -> %s", rn, l["panel_url"], err)
-                        errors.append(f"{rn}@{l['panel_url']}: {err}")
-                    links.extend(ls)
-            else:
-                u = fetch_user(l["panel_url"], l["access_token"], l["remote_username"])
-                if u and u.get("key"):
-                    ls, err = fetch_links_from_panel(
-                        l["panel_url"], l["remote_username"], u["key"]
-                    )
-                    if err:
-                        log.warning(
-                            "fetch %s@%s -> %s", l["remote_username"], l["panel_url"], err
+    remote_info = None
+    if not agent_blocked and not limit_reached:
+        if mapped:
+            for l in mapped:
+                disabled_names = get_panel_disabled_names(l["panel_id"])
+                disabled_nums = get_panel_disabled_nums(l["panel_id"])
+                links = []
+                if l.get("panel_type") == "sanaei":
+                    remotes = [r.strip() for r in l["remote_username"].split(",") if r.strip()]
+                    for rn in remotes:
+                        if remote_info is None:
+                            u, uerr = sanaei.get_user(l["panel_url"], l["access_token"], rn)
+                            if uerr:
+                                log.warning("fetch %s@%s info -> %s", rn, l["panel_url"], uerr)
+                            else:
+                                remote_info = u
+                        ls, err = sanaei.fetch_links_from_panel(
+                            l["panel_url"], l["access_token"], rn
                         )
-                        errors.append(
-                            f"{l['remote_username']}@{l['panel_url']}: {err}"
+                        if err:
+                            log.warning("fetch %s@%s -> %s", rn, l["panel_url"], err)
+                            errors.append(f"{rn}@{l['panel_url']}: {err}")
+                        links.extend(ls)
+                else:
+                    u = fetch_user(l["panel_url"], l["access_token"], l["remote_username"])
+                    if remote_info is None:
+                        remote_info = u
+                    if u and u.get("key"):
+                        ls, err = fetch_links_from_panel(
+                            l["panel_url"], l["remote_username"], u["key"]
                         )
-                    links.extend(ls)
-            if disabled_names:
-                links = [x for x in links if (extract_name(x) or "") not in disabled_names]
-            if disabled_nums:
-                links = [x for idx, x in enumerate(links, 1) if idx not in disabled_nums]
-            all_links.extend(links)
-    else:
-        for p in list_all_panels(owner_id):
-            disabled_names = get_panel_disabled_names(p["id"])
-            disabled_nums = get_panel_disabled_nums(p["id"])
-            links = []
-            err = None
-            if p.get("panel_type") == "sanaei":
-                links, err = sanaei.fetch_links_from_panel(
-                    p["panel_url"], p["access_token"], local_username
-                )
-            else:
-                u = fetch_user(p["panel_url"], p["access_token"], local_username)
-                if u and u.get("key"):
-                    links, err = fetch_links_from_panel(
-                        p["panel_url"], local_username, u["key"]
+                        if err:
+                            log.warning(
+                                "fetch %s@%s -> %s", l["remote_username"], l["panel_url"], err
+                            )
+                            errors.append(
+                                f"{l['remote_username']}@{l['panel_url']}: {err}"
+                            )
+                        links.extend(ls)
+                if disabled_names:
+                    links = [x for x in links if (extract_name(x) or "") not in disabled_names]
+                if disabled_nums:
+                    links = [x for idx, x in enumerate(links, 1) if idx not in disabled_nums]
+                all_links.extend(links)
+        else:
+            for p in list_all_panels(owner_id):
+                disabled_names = get_panel_disabled_names(p["id"])
+                disabled_nums = get_panel_disabled_nums(p["id"])
+                links = []
+                err = None
+                if p.get("panel_type") == "sanaei":
+                    if remote_info is None:
+                        u, uerr = sanaei.get_user(p["panel_url"], p["access_token"], local_username)
+                        if uerr:
+                            log.warning("fetch %s@%s info -> %s", local_username, p["panel_url"], uerr)
+                        else:
+                            remote_info = u
+                    links, err = sanaei.fetch_links_from_panel(
+                        p["panel_url"], p["access_token"], local_username
                     )
-            if err:
-                log.warning("fetch %s@%s -> %s", local_username, p["panel_url"], err)
-                errors.append(f"{local_username}@{p['panel_url']}: {err}")
-            if disabled_names:
-                links = [x for x in links if (extract_name(x) or "") not in disabled_names]
-            if disabled_nums:
-                links = [x for idx, x in enumerate(links, 1) if idx not in disabled_nums]
-            all_links.extend(links)
+                else:
+                    u = fetch_user(p["panel_url"], p["access_token"], local_username)
+                    if remote_info is None:
+                        remote_info = u
+                    if u and u.get("key"):
+                        links, err = fetch_links_from_panel(
+                            p["panel_url"], local_username, u["key"]
+                        )
+                if err:
+                    log.warning("fetch %s@%s -> %s", local_username, p["panel_url"], err)
+                    errors.append(f"{local_username}@{p['panel_url']}: {err}")
+                if disabled_names:
+                    links = [x for x in links if (extract_name(x) or "") not in disabled_names]
+                if disabled_nums:
+                    links = [x for idx, x in enumerate(links, 1) if idx not in disabled_nums]
+                all_links.extend(links)
 
     uniq = filter_dedupe(all_links)
     if uniq:
@@ -445,6 +541,9 @@ def unified_links(local_username, app_key):
         body = ""
 
     remaining = (limit - used) if limit > 0 else -1
+    if want_html:
+        user = build_user(local_username, app_key, lu, remote_info)
+        return render_template_string(HTML_TEMPLATE, user=user)
     resp = Response(body, mimetype="text/plain")
     resp.headers["X-Plan-Limit-Bytes"] = str(limit)
     resp.headers["X-Used-Bytes"] = str(used)
