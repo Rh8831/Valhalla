@@ -123,8 +123,14 @@ def mark_user_disabled(owner_id, local_username):
 def disable_remote(panel_type, panel_url, token, remote_username):
     try:
         if panel_type == "sanaei":
-            ok, msg = sanaei.disable_remote_user(panel_url, token, remote_username)
-            return (200 if ok else None), msg
+            remotes = [r.strip() for r in remote_username.split(",") if r.strip()]
+            all_ok, last_msg = True, None
+            for rn in remotes:
+                ok, msg = sanaei.disable_remote_user(panel_url, token, rn)
+                if not ok:
+                    all_ok = False
+                    last_msg = msg
+            return (200 if all_ok else None), last_msg
         # Try Marzneshin style first
         url = urljoin(panel_url.rstrip("/") + "/", f"api/users/{remote_username}/disable")
         r = requests.post(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
@@ -376,20 +382,30 @@ def unified_links(local_username, app_key):
             disabled_names = get_panel_disabled_names(l["panel_id"])
             disabled_nums = get_panel_disabled_nums(l["panel_id"])
             links = []
-            err = None
             if l.get("panel_type") == "sanaei":
-                links, err = sanaei.fetch_links_from_panel(
-                    l["panel_url"], l["access_token"], l["remote_username"]
-                )
+                remotes = [r.strip() for r in l["remote_username"].split(",") if r.strip()]
+                for rn in remotes:
+                    ls, err = sanaei.fetch_links_from_panel(
+                        l["panel_url"], l["access_token"], rn
+                    )
+                    if err:
+                        log.warning("fetch %s@%s -> %s", rn, l["panel_url"], err)
+                        errors.append(f"{rn}@{l['panel_url']}: {err}")
+                    links.extend(ls)
             else:
                 u = fetch_user(l["panel_url"], l["access_token"], l["remote_username"])
                 if u and u.get("key"):
-                    links, err = fetch_links_from_panel(
+                    ls, err = fetch_links_from_panel(
                         l["panel_url"], l["remote_username"], u["key"]
                     )
-            if err:
-                log.warning("fetch %s@%s -> %s", l["remote_username"], l["panel_url"], err)
-                errors.append(f"{l['remote_username']}@{l['panel_url']}: {err}")
+                    if err:
+                        log.warning(
+                            "fetch %s@%s -> %s", l["remote_username"], l["panel_url"], err
+                        )
+                        errors.append(
+                            f"{l['remote_username']}@{l['panel_url']}: {err}"
+                        )
+                    links.extend(ls)
             if disabled_names:
                 links = [x for x in links if (extract_name(x) or "") not in disabled_names]
             if disabled_nums:
