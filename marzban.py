@@ -144,6 +144,21 @@ def enable_remote_user(panel_url: str, token: str, username: str) -> Tuple[bool,
         return False, str(e)[:200]
 
 
+def remove_remote_user(panel_url: str, token: str, username: str) -> Tuple[bool, Optional[str]]:
+    """Delete a user on the panel."""
+    try:
+        r = requests.delete(
+            urljoin(panel_url.rstrip('/') + '/', f"/api/user/{username}"),
+            headers=get_headers(token),
+            timeout=20,
+        )
+        if r.status_code == 200:
+            return True, None
+        return False, f"{r.status_code} {r.text[:200]}"
+    except Exception as e:  # pragma: no cover - network errors
+        return False, str(e)[:200]
+
+
 def fetch_subscription_links(sub_url: str) -> List[str]:
     """Return links from a subscription URL.
 
