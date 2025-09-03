@@ -64,6 +64,16 @@ class CurCtx:
             self.cur.close()
             self.conn.close()
 
+def admin_ids():
+    ids = (os.getenv("ADMIN_IDS") or "").strip()
+    if not ids:
+        return set()
+    return {int(x.strip()) for x in ids.split(",") if x.strip().isdigit()}
+
+def expand_owner_ids(owner_id: int) -> list[int]:
+    ids = admin_ids()
+    return list(ids) if owner_id in ids else [owner_id]
+
 # ---------- queries ----------
 def get_owner_id(app_username, app_key):
     with CurCtx() as cur:
@@ -75,13 +85,18 @@ def get_owner_id(app_username, app_key):
         return int(row["telegram_user_id"]) if row else None
 
 def get_local_user(owner_id, local_username):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with CurCtx() as cur:
-        cur.execute("""
-            SELECT owner_id, username, plan_limit_bytes, used_bytes, disabled_pushed
+        cur.execute(
+            f"""
+            SELECT owner_id, username, plan_limit_bytes, used_bytes, expire_at, disabled_pushed
             FROM local_users
-            WHERE owner_id=%s AND username=%s
+            WHERE owner_id IN ({placeholders}) AND username=%s
             LIMIT 1
-        """, (owner_id, local_username))
+        """,
+            tuple(ids) + (local_username,),
+        )
         return cur.fetchone()
 
 def list_mapped_links(owner_id, local_username):
@@ -90,16 +105,18 @@ def list_mapped_links(owner_id, local_username):
     Only the data required for API-based subscription fetching is selected; any
     panel-level subscription URL configured for name filtering is ignored here.
     """
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with CurCtx() as cur:
         cur.execute(
-            """
+            f"""
             SELECT lup.panel_id, lup.remote_username,
                    p.panel_url, p.access_token, p.panel_type
             FROM local_user_panel_links lup
             JOIN panels p ON p.id = lup.panel_id
-            WHERE lup.owner_id=%s AND lup.local_username=%s
+            WHERE lup.owner_id IN ({placeholders}) AND lup.local_username=%s
             """,
-            (owner_id, local_username),
+            tuple(ids) + (local_username,),
         )
         return cur.fetchall()
 
@@ -110,20 +127,27 @@ def list_all_panels(owner_id):
     returned as the unified subscription now fetches configs directly via the
     panel API.
     """
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with CurCtx() as cur:
         cur.execute(
-            "SELECT id, panel_url, access_token, panel_type FROM panels WHERE telegram_user_id=%s",
-            (owner_id,),
+            f"SELECT id, panel_url, access_token, panel_type FROM panels WHERE telegram_user_id IN ({placeholders})",
+            tuple(ids),
         )
         return cur.fetchall()
 
 def mark_user_disabled(owner_id, local_username):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with CurCtx() as cur:
-        cur.execute("""
+        cur.execute(
+            f"""
             UPDATE local_users
             SET disabled_pushed=1, disabled_pushed_at=NOW()
-            WHERE owner_id=%s AND username=%s
-        """, (owner_id, local_username))
+            WHERE owner_id IN ({placeholders}) AND username=%s
+        """,
+            tuple(ids) + (local_username,),
+        )
 
 def disable_remote(panel_type, panel_url, token, remote_username):
     try:
@@ -287,37 +311,57 @@ def get_panel_disabled_nums(panel_id: int):
 
 # ---- agent-level ----
 def get_agent(owner_id: int):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with CurCtx() as cur:
-        cur.execute("""
+        cur.execute(
+            f"""
             SELECT telegram_user_id, plan_limit_bytes, expire_at, disabled_pushed
             FROM agents
-            WHERE telegram_user_id=%s AND active=1
+            WHERE telegram_user_id IN ({placeholders}) AND active=1
             LIMIT 1
-        """, (owner_id,))
+        """,
+            tuple(ids),
+        )
         return cur.fetchone()
 
 def get_agent_total_used(owner_id: int) -> int:
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with CurCtx() as cur:
-        cur.execute("SELECT COALESCE(SUM(used_bytes),0) AS su FROM local_users WHERE owner_id=%s", (owner_id,))
+        cur.execute(
+            f"SELECT COALESCE(SUM(used_bytes),0) AS su FROM local_users WHERE owner_id IN ({placeholders})",
+            tuple(ids),
+        )
         return int(cur.fetchone()["su"] or 0)
 
 def list_all_agent_links(owner_id: int):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with CurCtx() as cur:
-        cur.execute("""
+        cur.execute(
+            f"""
             SELECT lup.local_username, lup.remote_username, p.panel_url, p.access_token, p.panel_type
             FROM local_user_panel_links lup
             JOIN panels p ON p.id = lup.panel_id
-            WHERE lup.owner_id=%s
-        """, (owner_id,))
+            WHERE lup.owner_id IN ({placeholders})
+        """,
+            tuple(ids),
+        )
         return cur.fetchall()
 
 def mark_agent_disabled(owner_id: int):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with CurCtx() as cur:
-        cur.execute("""
+        cur.execute(
+            f"""
             UPDATE agents
             SET disabled_pushed=1, disabled_pushed_at=NOW()
-            WHERE telegram_user_id=%s
-        """, (owner_id,))
+            WHERE telegram_user_id IN ({placeholders})
+        """,
+            tuple(ids),
+        )
 
 # ---------- app ----------
 app = Flask(__name__)
@@ -354,6 +398,16 @@ def build_user(local_username, app_key, lu, remote=None):
             or remote.get("expire_at")
             or ""
         )
+    if not expire_raw and lu:
+        exp_l = lu.get("expire_at")
+        if exp_l:
+            try:
+                if isinstance(exp_l, datetime):
+                    expire_raw = str(int(exp_l.timestamp()))
+                else:
+                    expire_raw = str(int(datetime.fromisoformat(str(exp_l)).timestamp()))
+            except Exception:
+                expire_raw = ""
     data_limit_reached = bool(limit > 0 and used >= limit)
     expired = False
     try:
