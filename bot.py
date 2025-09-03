@@ -494,6 +494,64 @@ def renew_user(owner_id: int, username: str, add_days: int):
             params
         )
 
+
+def list_user_links(owner_id: int, local_username: str):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            f"""SELECT lup.panel_id, lup.remote_username,
+                      p.panel_url, p.access_token, p.panel_type
+                 FROM local_user_panel_links lup
+                 JOIN panels p ON p.id = lup.panel_id
+                 WHERE lup.owner_id IN ({placeholders}) AND lup.local_username=%s""",
+            tuple(ids) + (local_username,),
+        )
+        return cur.fetchall()
+
+
+def delete_local_user(owner_id: int, username: str):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    params = tuple(ids) + (username,)
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            f"DELETE FROM local_user_panel_links WHERE owner_id IN ({placeholders}) AND local_username=%s",
+            params,
+        )
+        cur.execute(
+            f"DELETE FROM local_users WHERE owner_id IN ({placeholders}) AND username=%s",
+            params,
+        )
+        cur.execute(
+            f"DELETE FROM app_users WHERE telegram_user_id IN ({placeholders}) AND username=%s",
+            params,
+        )
+
+
+def delete_user(owner_id: int, username: str):
+    rows = list_user_links(owner_id, username)
+    for r in rows:
+        try:
+            api = get_api(r.get("panel_type"))
+            remotes = (
+                r["remote_username"].split(",")
+                if r.get("panel_type") == "sanaei"
+                else [r["remote_username"]]
+            )
+            for rn in remotes:
+                ok, err = api.remove_remote_user(r["panel_url"], r["access_token"], rn)
+                if not ok:
+                    log.warning(
+                        "remote delete failed on %s@%s: %s",
+                        rn,
+                        r["panel_url"],
+                        err or "unknown",
+                    )
+        except Exception as e:
+            log.warning("remote delete exception: %s", e)
+    delete_local_user(owner_id, username)
+
 # panels extra
 def set_panel_sub_url(owner_id: int, panel_id: int, sub_url: str | None):
     ids = expand_owner_ids(owner_id)
@@ -980,6 +1038,27 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
         return await show_panel_select(q, context, uid, mode="edit", username=uname)
 
+    if data == "act_del_user":
+        uname = context.user_data.get("manage_username")
+        if not uname:
+            await q.edit_message_text("یوزر انتخاب نشده.")
+            return ConversationHandler.END
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ بله، حذف کن", callback_data="act_del_user_yes")],
+            [InlineKeyboardButton("⬅️ انصراف", callback_data=f"user_sel:{uname}")],
+        ])
+        await q.edit_message_text(f"کاربر {uname} حذف شود؟", reply_markup=kb)
+        return ConversationHandler.END
+
+    if data == "act_del_user_yes":
+        uname = context.user_data.get("manage_username")
+        if not uname:
+            await q.edit_message_text("یوزر انتخاب نشده.")
+            return ConversationHandler.END
+        delete_user(uid, uname)
+        await q.edit_message_text("✅ کاربر حذف شد.")
+        return ConversationHandler.END
+
     # ----- agent mgmt (admin) -----
     if data == "manage_agents":
         if not is_admin(uid):
@@ -1403,6 +1482,7 @@ async def show_user_card(q, owner_id: int, uname: str, notice: str = None):
         [InlineKeyboardButton("🧹 Reset Used", callback_data="act_reset_used")],
         [InlineKeyboardButton("🔁 Renew (add days)", callback_data="act_renew")],
         [InlineKeyboardButton("🧩 Panels", callback_data="act_user_panels")],
+        [InlineKeyboardButton("🗑️ Delete User", callback_data="act_del_user")],
         [InlineKeyboardButton("⬅️ Back", callback_data="list_users:0")],
     ]
     await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
