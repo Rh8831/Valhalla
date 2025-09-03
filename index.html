@@ -469,6 +469,20 @@
       setTimeout(()=>{ el.innerHTML=old; el.style.background=''; el.style.color=''; },1400);
     }
 
+    async function copyText(text){
+      if(navigator.clipboard && window.isSecureContext){
+        return navigator.clipboard.writeText(text);
+      }
+      const ta=document.createElement('textarea');
+      ta.value=text;
+      ta.style.position='fixed';
+      ta.style.top='-1000px';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      try{ document.execCommand('copy'); }finally{ document.body.removeChild(ta); }
+    }
+
     function initSemiGauge(el, percent){
       const prog=el.querySelector('.progress'); const len=prog.getTotalLength();
       prog.style.strokeDasharray=len; prog.style.strokeDashoffset=len*(1-Math.max(0,Math.min(100,percent))/100);
@@ -581,7 +595,7 @@
         const copyBtn = row.querySelector('.copy');
         copyBtn.addEventListener('click', async (e)=>{
           addRipple(e);
-          try{ await navigator.clipboard.writeText(it.url); flash(copyBtn,'کپی شد'); }catch(_){}
+          try{ await copyText(it.url); flash(copyBtn,'کپی شد'); }catch(_){}
         });
         wrap.appendChild(row);
       });
@@ -612,7 +626,7 @@
         addRipple(e);
         const btn=e.currentTarget;
         const full=/^https?:\/\//i.test(SUBSCRIPTION_URL)?SUBSCRIPTION_URL:(location.origin+SUBSCRIPTION_URL);
-        try{ await navigator.clipboard.writeText(full); flash(btn,'کپی شد'); }catch(_){}
+        try{ await copyText(full); flash(btn,'کپی شد'); }catch(_){}
       });
       document.getElementById('copyAll')?.addEventListener('click',async (e)=>{
         addRipple(e);
@@ -621,7 +635,7 @@
           const res=await fetch(full); const text=await res.text();
           const content=decodeBase64Maybe(text).trim();
           const onlyUris = content.split('\n').map(s=>s.trim()).filter(s=>/^(vmess|vless|trojan|ss):\/\//i.test(s)).join('\n');
-          await navigator.clipboard.writeText(onlyUris||content);
+          await copyText(onlyUris||content);
           flash(document.getElementById('copyAll'),'همه کپی شد');
         }catch(_){}
       });
