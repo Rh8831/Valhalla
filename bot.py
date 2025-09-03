@@ -74,6 +74,25 @@ def admin_ids():
 def is_admin(tg_id: int) -> bool:
     return tg_id in admin_ids()
 
+def expand_owner_ids(owner_id: int) -> list[int]:
+    """Return list of relevant owner IDs for queries.
+
+    If the supplied owner_id belongs to an admin, include all admin IDs so
+    that multiple admins share the same data. Otherwise return the owner_id
+    itself.
+    """
+    ids = admin_ids()
+    return list(ids) if owner_id in ids else [owner_id]
+
+def canonical_owner_id(owner_id: int) -> int:
+    """Return canonical owner id for inserts/updates.
+
+    Data created by any admin is stored under the first admin id so other
+    admins can access it as well.
+    """
+    ids = expand_owner_ids(owner_id)
+    return ids[0]
+
 # ---------- states ----------
 (
     ASK_PANEL_NAME, ASK_PANEL_TYPE, ASK_PANEL_URL, ASK_PANEL_USER, ASK_PANEL_PASS,
@@ -302,8 +321,13 @@ def make_panel_name(url, u):
 
 # ---------- data access ----------
 def list_my_panels_admin(admin_tg_id: int):
+    ids = expand_owner_ids(admin_tg_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with with_mysql_cursor() as cur:
-        cur.execute("SELECT * FROM panels WHERE telegram_user_id=%s ORDER BY created_at DESC", (admin_tg_id,))
+        cur.execute(
+            f"SELECT * FROM panels WHERE telegram_user_id IN ({placeholders}) ORDER BY created_at DESC",
+            tuple(ids),
+        )
         return cur.fetchall()
 
 def list_panels_for_agent(agent_tg_id: int):
@@ -317,18 +341,31 @@ def list_panels_for_agent(agent_tg_id: int):
         return cur.fetchall()
 
 def upsert_app_user(tg_id: int, u: str) -> str:
+    owner_ids = expand_owner_ids(tg_id)
+    placeholders = ",".join(["%s"] * len(owner_ids))
     with with_mysql_cursor() as cur:
-        cur.execute("SELECT app_key FROM app_users WHERE telegram_user_id=%s AND username=%s", (tg_id, u))
+        cur.execute(
+            f"SELECT app_key FROM app_users WHERE telegram_user_id IN ({placeholders}) AND username=%s",
+            tuple(owner_ids) + (u,),
+        )
         row = cur.fetchone()
         if row:
             return row["app_key"]
         k = secrets.token_hex(16)
-        cur.execute("INSERT INTO app_users(telegram_user_id,username,app_key)VALUES(%s,%s,%s)", (tg_id, u, k))
+        cur.execute(
+            "INSERT INTO app_users(telegram_user_id,username,app_key)VALUES(%s,%s,%s)",
+            (canonical_owner_id(tg_id), u, k),
+        )
         return k
 
 def get_app_key(tg_id: int, u: str) -> str:
+    owner_ids = expand_owner_ids(tg_id)
+    placeholders = ",".join(["%s"] * len(owner_ids))
     with with_mysql_cursor() as cur:
-        cur.execute("SELECT app_key FROM app_users WHERE telegram_user_id=%s AND username=%s", (tg_id, u))
+        cur.execute(
+            f"SELECT app_key FROM app_users WHERE telegram_user_id IN ({placeholders}) AND username=%s",
+            tuple(owner_ids) + (u,),
+        )
         row = cur.fetchone()
     return row["app_key"] if row else upsert_app_user(tg_id, u)
 
@@ -342,7 +379,7 @@ def upsert_local_user(owner_id: int, username: str, limit_bytes: int, duration_d
                    plan_limit_bytes=VALUES(plan_limit_bytes),
                    expire_at=VALUES(expire_at),
                    disabled_pushed=0""",
-            (owner_id, username, int(limit_bytes), exp)
+            (canonical_owner_id(owner_id), username, int(limit_bytes), exp)
         )
 
 def save_link(owner_id: int, local_username: str, panel_id: int, remote_username: str):
@@ -351,95 +388,132 @@ def save_link(owner_id: int, local_username: str, panel_id: int, remote_username
             """INSERT INTO local_user_panel_links(owner_id,local_username,panel_id,remote_username)
                VALUES(%s,%s,%s,%s)
                ON DUPLICATE KEY UPDATE remote_username=VALUES(remote_username)""",
-            (owner_id, local_username, panel_id, remote_username)
+            (canonical_owner_id(owner_id), local_username, panel_id, remote_username)
         )
 
 def remove_link(owner_id: int, local_username: str, panel_id: int):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with with_mysql_cursor() as cur:
         cur.execute(
-            "DELETE FROM local_user_panel_links WHERE owner_id=%s AND local_username=%s AND panel_id=%s",
-            (owner_id, local_username, panel_id)
+            f"DELETE FROM local_user_panel_links WHERE owner_id IN ({placeholders}) AND local_username=%s AND panel_id=%s",
+            tuple(ids) + (local_username, panel_id)
         )
 
 def list_linked_panel_ids(owner_id: int, local_username: str):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with with_mysql_cursor() as cur:
         cur.execute(
-            "SELECT panel_id FROM local_user_panel_links WHERE owner_id=%s AND local_username=%s",
-            (owner_id, local_username)
+            f"SELECT panel_id FROM local_user_panel_links WHERE owner_id IN ({placeholders}) AND local_username=%s",
+            tuple(ids) + (local_username,)
         )
         return {int(r["panel_id"]) for r in cur.fetchall()}
 
 def map_linked_remote_usernames(owner_id: int, local_username: str):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with with_mysql_cursor() as cur:
         cur.execute(
-            "SELECT panel_id, remote_username FROM local_user_panel_links WHERE owner_id=%s AND local_username=%s",
-            (owner_id, local_username)
+            f"SELECT panel_id, remote_username FROM local_user_panel_links WHERE owner_id IN ({placeholders}) AND local_username=%s",
+            tuple(ids) + (local_username,)
         )
         return {int(r["panel_id"]): r["remote_username"] for r in cur.fetchall()}
 
 def get_local_user(owner_id: int, username: str):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with with_mysql_cursor() as cur:
         cur.execute(
-            "SELECT username,plan_limit_bytes,used_bytes,expire_at,disabled_pushed FROM local_users "
-            "WHERE owner_id=%s AND username=%s LIMIT 1",
-            (owner_id, username)
+            f"SELECT username,plan_limit_bytes,used_bytes,expire_at,disabled_pushed FROM local_users "
+            f"WHERE owner_id IN ({placeholders}) AND username=%s LIMIT 1",
+            tuple(ids) + (username,)
         )
         return cur.fetchone()
 
 def search_local_users(owner_id: int, q: str):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with with_mysql_cursor() as cur:
         cur.execute(
-            "SELECT username FROM local_users WHERE owner_id=%s AND username LIKE %s ORDER BY username ASC LIMIT 50",
-            (owner_id, f"%{q}%")
+            f"SELECT username FROM local_users WHERE owner_id IN ({placeholders}) AND username LIKE %s ORDER BY username ASC LIMIT 50",
+            tuple(ids) + (f"%{q}%",)
         )
         return cur.fetchall()
 
 def list_all_local_users(owner_id: int, offset: int = 0, limit: int = 25):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with with_mysql_cursor() as cur:
         cur.execute(
-            "SELECT username FROM local_users WHERE owner_id=%s ORDER BY username ASC LIMIT %s OFFSET %s",
-            (owner_id, limit, offset)
+            f"SELECT username FROM local_users WHERE owner_id IN ({placeholders}) ORDER BY username ASC LIMIT %s OFFSET %s",
+            tuple(ids) + (limit, offset)
         )
         return cur.fetchall()
 
 def count_local_users(owner_id: int) -> int:
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with with_mysql_cursor() as cur:
-        cur.execute("SELECT COUNT(*) c FROM local_users WHERE owner_id=%s", (owner_id,))
+        cur.execute(
+            f"SELECT COUNT(*) c FROM local_users WHERE owner_id IN ({placeholders})",
+            tuple(ids)
+        )
         return int(cur.fetchone()["c"])
 
 def update_limit(owner_id: int, username: str, new_limit_bytes: int):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    params = [int(new_limit_bytes)] + ids + [username]
     with with_mysql_cursor() as cur:
         cur.execute(
-            "UPDATE local_users SET plan_limit_bytes=%s WHERE owner_id=%s AND username=%s",
-            (int(new_limit_bytes), owner_id, username)
+            f"UPDATE local_users SET plan_limit_bytes=%s WHERE owner_id IN ({placeholders}) AND username=%s",
+            params
         )
 
 def reset_used(owner_id: int, username: str):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    params = ids + [username]
     with with_mysql_cursor() as cur:
         cur.execute(
-            "UPDATE local_users SET used_bytes=0 WHERE owner_id=%s AND username=%s",
-            (owner_id, username)
+            f"UPDATE local_users SET used_bytes=0 WHERE owner_id IN ({placeholders}) AND username=%s",
+            params
         )
 
 def renew_user(owner_id: int, username: str, add_days: int):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    params = [add_days, add_days] + ids + [username]
     with with_mysql_cursor() as cur:
         cur.execute(
-            """UPDATE local_users
+            f"""UPDATE local_users
                SET expire_at = IF(expire_at IS NULL, UTC_TIMESTAMP() + INTERVAL %s DAY,
                                     expire_at + INTERVAL %s DAY)
-               WHERE owner_id=%s AND username=%s""",
-            (add_days, add_days, owner_id, username)
+               WHERE owner_id IN ({placeholders}) AND username=%s""",
+            params
         )
 
 # panels extra
 def set_panel_sub_url(owner_id: int, panel_id: int, sub_url: str | None):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    params = [sub_url, int(panel_id)] + ids
     with with_mysql_cursor() as cur:
-        cur.execute("UPDATE panels SET sub_url=%s WHERE id=%s AND telegram_user_id=%s",
-                    (sub_url, int(panel_id), owner_id))
+        cur.execute(
+            f"UPDATE panels SET sub_url=%s WHERE id=%s AND telegram_user_id IN ({placeholders})",
+            params
+        )
 
 def get_panel(owner_id: int, panel_id: int):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    params = [int(panel_id)] + ids
     with with_mysql_cursor() as cur:
-        cur.execute("SELECT * FROM panels WHERE id=%s AND telegram_user_id=%s", (int(panel_id), owner_id))
+        cur.execute(
+            f"SELECT * FROM panels WHERE id=%s AND telegram_user_id IN ({placeholders})",
+            params
+        )
         return cur.fetchone()
 
 def canonicalize_name(name: str) -> str:
@@ -485,7 +559,7 @@ def set_panel_disabled_names(owner_id: int, panel_id: int, names):
                 INSERT INTO panel_disabled_configs(telegram_user_id,panel_id,config_name)
                 VALUES(%s,%s,%s)
                 """,
-                [(owner_id, int(panel_id), n) for n in clean],
+                [(canonical_owner_id(owner_id), int(panel_id), n) for n in clean],
             )
 
 def get_panel_disabled_nums(panel_id: int):
@@ -506,7 +580,7 @@ def set_panel_disabled_nums(owner_id: int, panel_id: int, nums):
                 INSERT INTO panel_disabled_numbers(telegram_user_id,panel_id,config_index)
                 VALUES(%s,%s,%s)
                 """,
-                [(owner_id, int(panel_id), n) for n in clean],
+                [(canonical_owner_id(owner_id), int(panel_id), n) for n in clean],
             )
 
 def list_panel_links(panel_id: int):
@@ -542,7 +616,12 @@ def delete_panel_and_cleanup(owner_id: int, panel_id: int):
         cur.execute("DELETE FROM local_user_panel_links WHERE panel_id=%s", (int(panel_id),))
         cur.execute("DELETE FROM panel_disabled_configs WHERE panel_id=%s", (int(panel_id),))
         cur.execute("DELETE FROM panel_disabled_numbers WHERE panel_id=%s", (int(panel_id),))
-        cur.execute("DELETE FROM panels WHERE id=%s AND telegram_user_id=%s", (int(panel_id), owner_id))
+        ids = expand_owner_ids(owner_id)
+        placeholders = ",".join(["%s"] * len(ids))
+        cur.execute(
+            f"DELETE FROM panels WHERE id=%s AND telegram_user_id IN ({placeholders})",
+            [int(panel_id)] + ids
+        )
 
 # ---------- agents ----------
 def upsert_agent(tg_id: int, name: str):
@@ -1474,8 +1553,12 @@ async def got_panel_template(update: Update, context: ContextTypes.DEFAULT_TYPE)
         val = ",".join(parts)
     try:
         with with_mysql_cursor() as cur:
-            cur.execute("UPDATE panels SET template_username=%s WHERE id=%s AND telegram_user_id=%s",
-                        (val, pid, update.effective_user.id))
+            ids = expand_owner_ids(update.effective_user.id)
+            placeholders = ",".join(["%s"] * len(ids))
+            cur.execute(
+                f"UPDATE panels SET template_username=%s WHERE id=%s AND telegram_user_id IN ({placeholders})",
+                tuple([val, pid] + ids),
+            )
         class FakeCQ:
             async def edit_message_text(self, *args, **kwargs):
                 await update.message.reply_text(*args, **kwargs)
@@ -1494,7 +1577,12 @@ async def got_edit_panel_name(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
     try:
         with with_mysql_cursor() as cur:
-            cur.execute("UPDATE panels SET name=%s WHERE id=%s AND telegram_user_id=%s", (new, pid, update.effective_user.id))
+            ids = expand_owner_ids(update.effective_user.id)
+            placeholders = ",".join(["%s"] * len(ids))
+            cur.execute(
+                f"UPDATE panels SET name=%s WHERE id=%s AND telegram_user_id IN ({placeholders})",
+                tuple([new, pid] + ids),
+            )
         class FakeCQ:
             async def edit_message_text(self, *args, **kwargs):
                 await update.message.reply_text(*args, **kwargs)
@@ -1523,10 +1611,12 @@ async def got_edit_panel_pass(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ ورودی نامعتبر.")
         return ConversationHandler.END
     try:
+        ids = expand_owner_ids(update.effective_user.id)
+        placeholders = ",".join(["%s"] * len(ids))
         with with_mysql_cursor() as cur:
             cur.execute(
-                "SELECT panel_url, panel_type FROM panels WHERE id=%s AND telegram_user_id=%s",
-                (pid, update.effective_user.id),
+                f"SELECT panel_url, panel_type FROM panels WHERE id=%s AND telegram_user_id IN ({placeholders})",
+                tuple([pid] + ids),
             )
             row = cur.fetchone()
         if not row:
@@ -1536,8 +1626,10 @@ async def got_edit_panel_pass(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not tok:
             raise RuntimeError(f"login failed: {err}")
         with with_mysql_cursor() as cur:
-            cur.execute("UPDATE panels SET admin_username=%s, access_token=%s WHERE id=%s AND telegram_user_id=%s",
-                        (new_user, tok, pid, update.effective_user.id))
+            cur.execute(
+                f"UPDATE panels SET admin_username=%s, access_token=%s WHERE id=%s AND telegram_user_id IN ({placeholders})",
+                tuple([new_user, tok, pid] + ids),
+            )
         context.user_data.pop("new_admin_user", None)
         class FakeCQ:
             async def edit_message_text(self, *args, **kwargs):
