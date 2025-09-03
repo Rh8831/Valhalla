@@ -358,6 +358,14 @@ def list_linked_panel_ids(owner_id: int, local_username: str):
         )
         return {int(r["panel_id"]) for r in cur.fetchall()}
 
+def map_linked_remote_usernames(owner_id: int, local_username: str):
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            "SELECT panel_id, remote_username FROM local_user_panel_links WHERE owner_id=%s AND local_username=%s",
+            (owner_id, local_username)
+        )
+        return {int(r["panel_id"]): r["remote_username"] for r in cur.fetchall()}
+
 def get_local_user(owner_id: int, username: str):
     with with_mysql_cursor() as cur:
         cur.execute(
@@ -507,9 +515,15 @@ def delete_panel_and_cleanup(owner_id: int, panel_id: int):
     for r in rows:
         try:
             api = get_api(r.get("panel_type"))
-            ok, err = api.disable_remote_user(r["panel_url"], r["access_token"], r["remote_username"])
-            if not ok:
-                log.warning("disable before delete failed on %s: %s", r["panel_url"], err or "unknown")
+            remotes = (
+                r["remote_username"].split(",")
+                if r.get("panel_type") == "sanaei"
+                else [r["remote_username"]]
+            )
+            for rn in remotes:
+                ok, err = api.disable_remote_user(r["panel_url"], r["access_token"], rn)
+                if not ok:
+                    log.warning("disable before delete failed on %s: %s", r["panel_url"], err or "unknown")
         except Exception as e:
             log.warning("disable before delete exception: %s", e)
     # 2) delete mappings + panel
@@ -714,7 +728,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(uid): return ConversationHandler.END
         pid = context.user_data.get("edit_panel_id")
         info = get_panel(uid, pid) if pid else None
-        prompt = "ID اینباند" if info and info.get("panel_type") == "sanaei" else "نام تمپلیت"
+        prompt = (
+            "ID اینباندها (با کاما جدا کن)" if info and info.get("panel_type") == "sanaei" else "نام تمپلیت"
+        )
         await q.edit_message_text(f"{prompt} را بفرست (برای حذف، '-'):") ; return ASK_PANEL_TEMPLATE
     if data == "p_rename":
         if not is_admin(uid): return ConversationHandler.END
@@ -724,6 +740,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("یوزرنیم ادمین جدید را بفرست:") ; return ASK_EDIT_PANEL_USER
     if data == "p_set_sub":
         if not is_admin(uid): return ConversationHandler.END
+        pid = context.user_data.get("edit_panel_id")
+        info = get_panel(uid, pid) if pid else None
+        if info and info.get("panel_type") == "sanaei":
+            await q.edit_message_text("این پنل از لینک سابسکریپشن پشتیبانی نمی‌کند.")
+            return ConversationHandler.END
         await q.edit_message_text("لینک سابسکریپشن پنل را بفرست (برای حذف، '-'):") ; return ASK_PANEL_SUB_URL
     if data == "p_filter_cfgs":
         if not is_admin(uid): return ConversationHandler.END
@@ -731,6 +752,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = get_panel(uid, pid)
         if not info:
             await q.edit_message_text("پنل پیدا نشد.")
+            return ConversationHandler.END
+        if info.get("panel_type") == "sanaei":
+            await q.edit_message_text("این پنل از فیلتر کانفیگ‌ها پشتیبانی نمی‌کند.")
             return ConversationHandler.END
         if not info.get("sub_url"):
             await q.edit_message_text("اول لینک سابسکریپشن پنل را تنظیم کن (Set/Clear Sub URL).")
@@ -742,6 +766,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = get_panel(uid, pid)
         if not info:
             await q.edit_message_text("پنل پیدا نشد.")
+            return ConversationHandler.END
+        if info.get("panel_type") == "sanaei":
+            await q.edit_message_text("این پنل از فیلتر کانفیگ‌ها پشتیبانی نمی‌کند.")
             return ConversationHandler.END
         if not info.get("sub_url"):
             await q.edit_message_text("اول لینک سابسکریپشن پنل را تنظیم کن (Set/Clear Sub URL).")
@@ -1175,7 +1202,10 @@ async def show_panel_card(q, context: ContextTypes.DEFAULT_TYPE, owner_id: int, 
         f"🌐 URL: <code>{p['panel_url']}</code>",
         f"👤 Admin: <code>{p['admin_username']}</code>",
         f"🧬 {label}: <b>{p.get('template_username') or '-'}</b>",
-        f"🔗 Sub URL: <code>{p.get('sub_url') or '-'}</code>",
+    ]
+    if not is_sanaei:
+        lines.append(f"🔗 Sub URL: <code>{p.get('sub_url') or '-'}</code>")
+    lines += [
         "",
         "چه کاری انجام بدهم؟",
     ]
@@ -1183,12 +1213,13 @@ async def show_panel_card(q, context: ContextTypes.DEFAULT_TYPE, owner_id: int, 
         [InlineKeyboardButton(f"🧬 Set/Clear {label}", callback_data="p_set_template")],
         [InlineKeyboardButton("🔑 Change Admin Credentials", callback_data="p_change_creds")],
         [InlineKeyboardButton("✏️ Rename Panel", callback_data="p_rename")],
-        [InlineKeyboardButton("🔗 Set/Clear Sub URL", callback_data="p_set_sub")],
-        [InlineKeyboardButton("🧷 فیلتر کانفیگ‌های پنل", callback_data="p_filter_cfgs")],
-        [InlineKeyboardButton("🔢 فیلتر بر اساس شماره", callback_data="p_filter_cfgnums")],
-        [InlineKeyboardButton("🗑️ Remove Panel", callback_data="p_remove")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="manage_panels")],
     ]
+    if not is_sanaei:
+        kb.append([InlineKeyboardButton("🔗 Set/Clear Sub URL", callback_data="p_set_sub")])
+        kb.append([InlineKeyboardButton("🧷 فیلتر کانفیگ‌های پنل", callback_data="p_filter_cfgs")])
+        kb.append([InlineKeyboardButton("🔢 فیلتر بر اساس شماره", callback_data="p_filter_cfgnums")])
+    kb.append([InlineKeyboardButton("🗑️ Remove Panel", callback_data="p_remove")])
+    kb.append([InlineKeyboardButton("⬅️ Back", callback_data="manage_panels")])
     await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     return ConversationHandler.END
 
@@ -1335,9 +1366,12 @@ async def got_panel_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "INSERT INTO panels(telegram_user_id,panel_url,name,panel_type,admin_username,access_token)VALUES(%s,%s,%s,%s,%s,%s)",
                 (update.effective_user.id, panel_url, panel_name, panel_type, panel_user, tok)
             )
-        await update.message.reply_text(
-            f"✅ پنل اضافه شد: {panel_name}\nنکته: از 🛠️ Manage Panels می‌تونی Template و Sub URL را ست کنی."
-        )
+        msg = f"✅ پنل اضافه شد: {panel_name}"
+        if panel_type == "sanaei":
+            msg += "\nنکته: از 🛠️ Manage Panels می‌تونی Inbound ID را ست کنی."
+        else:
+            msg += "\nنکته: از 🛠️ Manage Panels می‌تونی Template و Sub URL را ست کنی."
+        await update.message.reply_text(msg)
     except MySQLError as e:
         await update.message.reply_text(f"❌ خطای DB: {e}")
     except Exception as e:
@@ -1357,6 +1391,13 @@ async def got_panel_template(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
     txt = (update.message.text or "").strip()
     val = None if txt == "-" else txt
+    info = get_panel(update.effective_user.id, pid)
+    if val and info and info.get("panel_type") == "sanaei":
+        parts = [p.strip() for p in val.split(",") if p.strip().isdigit()]
+        if not parts:
+            await update.message.reply_text("❌ شناسه‌های اینباند نامعتبر است.")
+            return ASK_PANEL_TEMPLATE
+        val = ",".join(parts)
     try:
         with with_mysql_cursor() as cur:
             cur.execute("UPDATE panels SET template_username=%s WHERE id=%s AND telegram_user_id=%s",
@@ -1618,7 +1659,8 @@ async def finalize_create_on_selected(q, context, owner_id: int, selected_ids: s
                 )
             per_panel[r["id"]] = {"service_ids": svc or []}
         elif r.get("panel_type") == "sanaei":
-            per_panel[r["id"]] = {"inbound_id": r.get("template_username")}
+            ids = [x.strip() for x in (r.get("template_username") or "").split(",") if x.strip().isdigit()]
+            per_panel[r["id"]] = {"inbound_ids": ids}
         else:
             tmpl = r.get("template_username")
             if not tmpl:
@@ -1646,6 +1688,7 @@ async def finalize_create_on_selected(q, context, owner_id: int, selected_ids: s
     ok, failed = 0, []
     for r in rows:
         api = get_api(r.get("panel_type"))
+        remote_name = app_username
         if r.get("panel_type") == "marzneshin":
             payload = {
                 "username": app_username,
@@ -1658,20 +1701,40 @@ async def finalize_create_on_selected(q, context, owner_id: int, selected_ids: s
             }
         elif r.get("panel_type") == "sanaei":
             expire_ts = 0 if usage_sec <= 0 else int(datetime.now(timezone.utc).timestamp()) + usage_sec
-            inb = per_panel.get(r["id"], {}).get("inbound_id")
-            client = {
-                "id": str(uuid.uuid4()),
-                "email": app_username,
-                "enable": True,
-            }
-            if limit_bytes > 0:
-                client["totalGB"] = limit_bytes
-            if expire_ts > 0:
-                client["expiryTime"] = expire_ts * 1000
-            payload = {
-                "id": int(inb),
-                "settings": json.dumps({"clients": [client]}, separators=(",", ":")),
-            }
+            inbound_ids = per_panel.get(r["id"], {}).get("inbound_ids", [])
+            remote_names = []
+            for inb in inbound_ids:
+                rn = f"{app_username}_{secrets.token_hex(3)}"
+                client = {
+                    "id": str(uuid.uuid4()),
+                    "email": rn,
+                    "enable": True,
+                }
+                if limit_bytes > 0:
+                    client["totalGB"] = limit_bytes
+                if expire_ts > 0:
+                    client["expiryTime"] = expire_ts * 1000
+                payload = {
+                    "id": int(inb),
+                    "settings": json.dumps({"clients": [client]}, separators=(",", ":")),
+                }
+                obj, e = api.create_user(r["panel_url"], r["access_token"], payload)
+                if not obj:
+                    obj, g = api.get_user(r["panel_url"], r["access_token"], rn)
+                    if not obj:
+                        failed.append(f"{r['panel_url']} (inb {inb}): {e or g or 'unknown error'}")
+                        continue
+                if not obj.get("enabled", True):
+                    ok_en, err_en = api.enable_remote_user(r["panel_url"], r["access_token"], rn)
+                    if not ok_en:
+                        failed.append(f"{r['panel_url']} (inb {inb}): enable failed - {err_en or 'unknown'}")
+                        continue
+                remote_names.append(rn)
+            if remote_names:
+                remote_name = ",".join(remote_names)
+                save_link(owner_id, app_username, r["id"], remote_name)
+                ok += 1
+            continue
         else:
             expire_ts = 0 if usage_sec <= 0 else int(datetime.now(timezone.utc).timestamp()) + usage_sec
             tmpl_info = per_panel.get(r["id"], {})
@@ -1686,15 +1749,15 @@ async def finalize_create_on_selected(q, context, owner_id: int, selected_ids: s
             }
         obj, e = api.create_user(r["panel_url"], r["access_token"], payload)
         if not obj:
-            obj, g = api.get_user(r["panel_url"], r["access_token"], app_username)
+            obj, g = api.get_user(r["panel_url"], r["access_token"], remote_name)
             if not obj:
                 failed.append(f"{r['panel_url']}: {e or g or 'unknown error'}")
                 continue
         if not obj.get("enabled", True):
-            ok_en, err_en = api.enable_remote_user(r["panel_url"], r["access_token"], app_username)
+            ok_en, err_en = api.enable_remote_user(r["panel_url"], r["access_token"], remote_name)
             if not ok_en:
                 failed.append(f"{r['panel_url']}: enable failed - {err_en or 'unknown'}")
-        save_link(owner_id, app_username, r["id"], app_username)
+        save_link(owner_id, app_username, r["id"], remote_name)
         ok += 1
 
     base = os.getenv("PUBLIC_BASE_URL", "http://localhost:5000").rstrip("/")
@@ -1705,7 +1768,8 @@ async def finalize_create_on_selected(q, context, owner_id: int, selected_ids: s
     await q.edit_message_text(txt)
 
 async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: set):
-    current = list_linked_panel_ids(owner_id, username)
+    links_map = map_linked_remote_usernames(owner_id, username)
+    current = set(links_map.keys())
     to_add = selected_ids - current
     to_remove = current - selected_ids
 
@@ -1717,22 +1781,18 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
     panels = list_panels_for_agent(owner_id) if not is_admin(owner_id) else list_my_panels_admin(owner_id)
     panels_map = {int(p["id"]): p for p in panels}
 
-    # NOTE: user may not exist (admin pressed panel edit without a valid local user)
     lu = get_local_user(owner_id, username)
     if lu:
         limit_bytes_default = int(lu["plan_limit_bytes"] or 0)
         exp = lu["expire_at"]
         usage_duration_default = max(86400, int((exp - datetime.utcnow()).total_seconds())) if exp else 3650*86400
     else:
-        # Safe defaults to avoid KeyError / NoneType when "activating a panel for admin (no user)"
         limit_bytes_default = 0
         usage_duration_default = 3650*86400
 
     if to_add:
         expire_ts_default = (
-            0
-            if usage_duration_default <= 0
-            else int(datetime.now(timezone.utc).timestamp()) + usage_duration_default
+            0 if usage_duration_default <= 0 else int(datetime.now(timezone.utc).timestamp()) + usage_duration_default
         )
         for pid in to_add:
             p = panels_map.get(int(pid))
@@ -1749,6 +1809,7 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
                             if not ok_en:
                                 added_errs.append(f"{p['panel_url']}: enable failed - {err_en or 'unknown'}")
                         save_link(owner_id, username, int(pid), username)
+                        links_map[int(pid)] = username
                         added_ok += 1
                     else:
                         added_errs.append(f"{p['panel_url']}: no template & user not found")
@@ -1763,6 +1824,7 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
                             if not ok_en:
                                 added_errs.append(f"{p['panel_url']}: enable failed - {err_en or 'unknown'}")
                         save_link(owner_id, username, int(pid), username)
+                        links_map[int(pid)] = username
                         added_ok += 1
                     else:
                         added_errs.append(f"{p['panel_url']}: {e}")
@@ -1790,37 +1852,48 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
                         added_errs.append(f"{p['panel_url']}: enable failed - {err_en or 'unknown'}")
 
                 save_link(owner_id, username, int(pid), username)
+                links_map[int(pid)] = username
                 added_ok += 1
             elif p.get("panel_type") == "sanaei":
-                obj, g = api.get_user(p["panel_url"], p["access_token"], username)
-                if not obj:
-                    if tmpl:
-                        client = {
-                            "id": str(uuid.uuid4()),
-                            "email": username,
-                            "enable": True,
-                        }
-                        if limit_bytes_default > 0:
-                            client["totalGB"] = limit_bytes_default
-                        if expire_ts_default > 0:
-                            client["expiryTime"] = expire_ts_default * 1000
-                        payload = {
-                            "id": int(tmpl),
-                            "settings": json.dumps({"clients": [client]}, separators=(",", ":")),
-                        }
-                        obj, e2 = api.create_user(p["panel_url"], p["access_token"], payload)
-                        if not obj:
-                            added_errs.append(f"{p['panel_url']}: {e2 or 'unknown error'}")
-                            continue
-                    else:
-                        added_errs.append(f"{p['panel_url']}: inbound missing & user not found")
+                if not tmpl:
+                    added_errs.append(f"{p['panel_url']}: inbound missing")
+                    continue
+                inb_ids = [x.strip() for x in tmpl.split(",") if x.strip().isdigit()]
+                if not inb_ids:
+                    added_errs.append(f"{p['panel_url']}: inbound missing")
+                    continue
+                remote_names = []
+                for inb in inb_ids:
+                    remote_name = f"{username}_{secrets.token_hex(3)}"
+                    client = {
+                        "id": str(uuid.uuid4()),
+                        "email": remote_name,
+                        "enable": True,
+                    }
+                    if limit_bytes_default > 0:
+                        client["totalGB"] = limit_bytes_default
+                    if expire_ts_default > 0:
+                        client["expiryTime"] = expire_ts_default * 1000
+                    payload = {
+                        "id": int(inb),
+                        "settings": json.dumps({"clients": [client]}, separators=(",", ":")),
+                    }
+                    obj, e2 = api.create_user(p["panel_url"], p["access_token"], payload)
+                    if not obj:
+                        added_errs.append(f"{p['panel_url']} (inb {inb}): {e2 or 'unknown error'}")
                         continue
-                if not obj.get("enabled", True):
-                    ok_en, err_en = api.enable_remote_user(p["panel_url"], p["access_token"], username)
-                    if not ok_en:
-                        added_errs.append(f"{p['panel_url']}: enable failed - {err_en or 'unknown'}")
-                save_link(owner_id, username, int(pid), username)
-                added_ok += 1
+                    if not obj.get("enabled", True):
+                        ok_en, err_en = api.enable_remote_user(p["panel_url"], p["access_token"], remote_name)
+                        if not ok_en:
+                            added_errs.append(f"{p['panel_url']} (inb {inb}): enable failed - {err_en or 'unknown'}")
+                            continue
+                    remote_names.append(remote_name)
+                if remote_names:
+                    joined = ",".join(remote_names)
+                    save_link(owner_id, username, int(pid), joined)
+                    links_map[int(pid)] = joined
+                    added_ok += 1
+                continue
             else:
                 obj, g = api.get_user(p["panel_url"], p["access_token"], username)
                 if not obj:
@@ -1864,34 +1937,42 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
                             f"{p['panel_url']}: enable failed - {err_en or 'unknown'}"
                         )
                 save_link(owner_id, username, int(pid), username)
+                links_map[int(pid)] = username
                 added_ok += 1
 
     if to_remove:
         for pid in to_remove:
             p = panels_map.get(int(pid))
+            remote = links_map.get(int(pid), username)
             remove_link(owner_id, username, int(pid))
+            links_map.pop(int(pid), None)
             removed += 1
             if p:
                 api = get_api(p.get("panel_type"))
-                ok, err = api.disable_remote_user(p["panel_url"], p["access_token"], username)
-                if not ok:
-                    added_errs.append(f"disable on {p['panel_url']}: {err or 'unknown error'}")
+                remotes = remote.split(",") if p.get("panel_type") == "sanaei" else [remote]
+                for rn in remotes:
+                    ok, err = api.disable_remote_user(p["panel_url"], p["access_token"], rn)
+                    if not ok:
+                        added_errs.append(f"disable on {p['panel_url']}: {err or 'unknown error'}")
 
     for pid in selected_ids:
         p = panels_map.get(int(pid))
         if not p:
             continue
         api = get_api(p.get("panel_type"))
-        obj, g = api.get_user(p["panel_url"], p["access_token"], username)
-        if obj:
-            if not obj.get("enabled", True):
-                ok_en, err_en = api.enable_remote_user(p["panel_url"], p["access_token"], username)
+        remote = links_map.get(int(pid), username)
+        remotes = remote.split(",") if p.get("panel_type") == "sanaei" else [remote]
+        for rn in remotes:
+            obj, g = api.get_user(p["panel_url"], p["access_token"], rn)
+            if obj and not obj.get("enabled", True):
+                ok_en, err_en = api.enable_remote_user(p["panel_url"], p["access_token"], rn)
                 if ok_en:
                     enabled_ok += 1
                 else:
                     added_errs.append(f"{p['panel_url']}: enable failed - {err_en or 'unknown'}")
-            if pid not in list_linked_panel_ids(owner_id, username):
-                save_link(owner_id, username, int(pid), username)
+        if int(pid) not in links_map:
+            save_link(owner_id, username, int(pid), remote)
+            links_map[int(pid)] = remote
 
     note = f"✅ اعمال شد. اضافه/ایجاد: {added_ok} | حذف مپ/دیسیبل: {removed} | فعال‌شده‌ها: {enabled_ok}"
     if added_errs:
