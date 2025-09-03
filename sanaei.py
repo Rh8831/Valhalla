@@ -112,12 +112,20 @@ def get_user(panel_url: str, token: str, username: str) -> Tuple[Optional[Dict],
         down = int(obj.get('down', 0) or 0)
         enabled = bool(obj.get('enable', True))
         used = up + down
+        exp = (
+            obj.get('expiryTime')
+            or obj.get('expiry_time')
+            or client.get('expiryTime')
+            or client.get('expiry_time')
+        )
     except Exception as e:  # pragma: no cover - network errors
         return None, str(e)[:200]
     res = {
         'uuid': uuid,
         'enabled': enabled,
         'used_traffic': used,
+        'expiryTime': exp,
+        'expiry_time': exp,
         'protocol': inbound.get('protocol'),
         'port': inbound.get('port'),
         'listen': inbound.get('listen'),
