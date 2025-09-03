@@ -64,6 +64,30 @@ API_MODULES = {
 def get_api(panel_type: str):
     return API_MODULES.get(panel_type or "marzneshin", marzneshin)
 
+# ---------- proxy helpers ----------
+def clone_proxy_settings(proxies: dict) -> dict:
+    """Copy proxy settings and regenerate credentials.
+
+    Ensures each created user receives unique identifiers instead of reusing
+    UUIDs or passwords from the template user.
+    """
+    cleaned = {}
+    for ptype, settings in (proxies or {}).items():
+        if not isinstance(settings, dict):
+            cleaned[ptype] = settings
+            continue
+        s = settings.copy()
+        if "id" in s:
+            s["id"] = str(uuid.uuid4())
+        if "uuid" in s:
+            s["uuid"] = str(uuid.uuid4())
+        if "password" in s:
+            s["password"] = secrets.token_hex(8)
+        if "pass" in s:
+            s["pass"] = secrets.token_hex(8)
+        cleaned[ptype] = s
+    return cleaned
+
 # ---------- roles ----------
 def admin_ids():
     ids = (os.getenv("ADMIN_IDS") or "").strip()
@@ -2037,7 +2061,7 @@ async def finalize_create_on_selected(q, context, owner_id: int, selected_ids: s
                 "data_limit": limit_bytes,
                 "data_limit_reset_strategy": "no_reset",
                 "note": "created_by_bot",
-                "proxies": tmpl_info.get("proxies", {}),
+                "proxies": clone_proxy_settings(tmpl_info.get("proxies", {})),
                 "inbounds": tmpl_info.get("inbounds", {}),
             }
         obj, e = api.create_user(r["panel_url"], r["access_token"], payload)
@@ -2205,7 +2229,7 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
                             "data_limit": limit_bytes_default,
                             "data_limit_reset_strategy": "no_reset",
                             "note": "user_edit_add_panel",
-                            "proxies": tmpl_obj.get("proxies") or {},
+                            "proxies": clone_proxy_settings(tmpl_obj.get("proxies") or {}),
                             "inbounds": tmpl_obj.get("inbounds") or {},
                         }
                         obj, e2 = api.create_user(
