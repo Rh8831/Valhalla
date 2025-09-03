@@ -170,6 +170,13 @@
       <div class="info-panel fade-in-up" style="animation-delay:.05s">
         <div class="info-row"><div style="color:var(--muted)">نام کاربری</div><div class="font-semibold">{{ user.username }}</div></div>
         <div class="info-row"><div style="color:var(--muted)">مصرف کل</div><div class="font-semibold"><span class="num-unit">{{ user.used_traffic | bytesformat }}</span></div></div>
+        <div class="info-row"><div style="color:var(--muted)">حجم مجاز</div><div class="font-semibold">
+          {% if user.data_limit %}
+            <span class="num-unit">{{ user.data_limit | bytesformat }}</span>
+          {% else %}
+            نامحدود
+          {% endif %}
+        </div></div>
         <div class="info-row"><div style="color:var(--muted)">پایان اشتراک</div><div class="font-semibold"><span id="expire-jalali">—</span></div></div>
       </div>
 

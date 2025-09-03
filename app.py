@@ -16,7 +16,8 @@ from urllib.parse import urljoin, unquote
 
 import base64
 import requests
-from flask import Flask, Response, abort
+from flask import Flask, Response, abort, render_template, url_for
+from jinja2 import TemplateNotFound
 from dotenv import load_dotenv
 from mysql.connector import pooling
 import sanaei
@@ -315,7 +316,22 @@ def mark_agent_disabled(owner_id: int):
         """, (owner_id,))
 
 # ---------- app ----------
-app = Flask(__name__)
+app = Flask(__name__, template_folder=".")
+
+
+def bytesformat(num):
+    """Format *num* bytes into a human-readable string."""
+    try:
+        num = float(num)
+    except (TypeError, ValueError):
+        return "0 B"
+    for unit in ["B", "KB", "MB", "GB", "TB", "PB"]:
+        if num < 1024 or unit == "PB":
+            return (f"{int(num)} B" if unit == "B" else f"{num:.2f} {unit}")
+        num /= 1024
+
+
+app.jinja_env.filters["bytesformat"] = bytesformat
 
 @app.route("/sub/<local_username>/<app_key>/links", methods=["GET"])
 def unified_links(local_username, app_key):
@@ -451,6 +467,70 @@ def unified_links(local_username, app_key):
     resp.headers["X-Remaining-Bytes"] = str(max(0, remaining)) if remaining >= 0 else "unlimited"
     resp.headers["X-Disabled-Pushed"] = str(pushed)
     return resp
+
+
+@app.route("/sub/<local_username>/<app_key>", methods=["GET"])
+def user_page(local_username, app_key):
+    """Serve the HTML panel without falling back to raw configs."""
+    owner_id = get_owner_id(local_username, app_key)
+    if not owner_id:
+        abort(404)
+
+    lu = get_local_user(owner_id, local_username)
+    used = int(lu["used_bytes"]) if lu else 0
+    limit = int(lu["plan_limit_bytes"]) if lu else 0
+    reset = "no_reset"
+    expire = ""
+    enabled = True
+    expired = False
+
+    links = list_mapped_links(owner_id, local_username)
+    remote = None
+    if links:
+        for l in links:
+            remote = fetch_user(l["panel_url"], l["access_token"], l["remote_username"])
+            if remote:
+                break
+    else:
+        for p in list_all_panels(owner_id):
+            remote = fetch_user(p["panel_url"], p["access_token"], local_username)
+            if remote:
+                break
+
+    if remote:
+        used = int(remote.get("used_traffic") or used)
+        limit = int(remote.get("data_limit") or limit)
+        dlrs = remote.get("data_limit_reset_strategy")
+        if isinstance(dlrs, dict):
+            reset = dlrs.get("value") or reset
+        elif dlrs:
+            reset = dlrs
+        expire = (
+            remote.get("expire_date")
+            or remote.get("expire_at")
+            or remote.get("expire")
+            or ""
+        )
+        enabled = remote.get("enabled", True)
+        expired = remote.get("expired", False)
+
+    sub_url = url_for("unified_links", local_username=local_username, app_key=app_key)
+    user = {
+        "username": local_username,
+        "used_traffic": used,
+        "data_limit": (limit if limit > 0 else None),
+        "data_limit_reset_strategy": {"value": reset},
+        "expire_date": expire,
+        "enabled": enabled,
+        "expired": expired,
+        "data_limit_reached": bool(limit > 0 and used >= limit),
+        "is_active": enabled and not expired,
+        "subscription_url": sub_url,
+    }
+    try:
+        return render_template("index.html", user=user)
+    except TemplateNotFound:
+        abort(500, description="index.html template not found")
 
 def main():
     load_dotenv()
