@@ -359,7 +359,8 @@ def build_user(local_username, app_key, lu, remote=None):
     try:
         if expire_raw:
             if isinstance(expire_raw, str) and not expire_raw.isdigit():
-                exp_ts = datetime.fromisoformat(expire_raw).timestamp()
+                exp_str = expire_raw.replace("Z", "+00:00")
+                exp_ts = datetime.fromisoformat(exp_str).timestamp()
             else:
                 exp_ts = float(expire_raw)
             if exp_ts > 1e12:
