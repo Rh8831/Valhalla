@@ -87,9 +87,10 @@ def is_admin(tg_id: int) -> bool:
     # agent mgmt
     ASK_AGENT_NAME, ASK_AGENT_TGID,
     ASK_AGENT_LIMIT, ASK_AGENT_RENEW_DAYS,   # changed: renew by days
+    ASK_AGENT_MAX_USERS, ASK_AGENT_MAX_USER_GB,
     ASK_ASSIGN_AGENT_PANELS,
     ASK_PANEL_REMOVE_CONFIRM,
-) = range(23)
+) = range(25)
 
 # ---------- MySQL ----------
 MYSQL_POOL = None
@@ -217,11 +218,21 @@ def ensure_schema():
                 plan_limit_bytes BIGINT NOT NULL DEFAULT 0,
                 expire_at DATETIME NULL,
                 active TINYINT(1) NOT NULL DEFAULT 1,
+                user_limit BIGINT NOT NULL DEFAULT 0,
+                max_user_bytes BIGINT NOT NULL DEFAULT 0,
                 disabled_pushed TINYINT(1) NOT NULL DEFAULT 0,
                 disabled_pushed_at DATETIME NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
+        try:
+            cur.execute("ALTER TABLE agents ADD COLUMN user_limit BIGINT NOT NULL DEFAULT 0")
+        except MySQLError:
+            pass
+        try:
+            cur.execute("ALTER TABLE agents ADD COLUMN max_user_bytes BIGINT NOT NULL DEFAULT 0")
+        except MySQLError:
+            pass
         cur.execute("""
             CREATE TABLE IF NOT EXISTS agent_panels(
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -541,8 +552,11 @@ def upsert_agent(tg_id: int, name: str):
         if row:
             cur.execute("UPDATE agents SET name=%s, active=1 WHERE telegram_user_id=%s", (name, tg_id))
         else:
-            cur.execute("INSERT INTO agents(telegram_user_id,name,plan_limit_bytes,expire_at,active) VALUES(%s,%s,0,NULL,1)",
-                        (tg_id, name))
+            cur.execute(
+                "INSERT INTO agents(telegram_user_id,name,plan_limit_bytes,expire_at,active,user_limit,max_user_bytes) "
+                "VALUES(%s,%s,0,NULL,1,0,0)",
+                (tg_id, name)
+            )
 
 def get_agent(tg_id: int):
     with with_mysql_cursor() as cur:
@@ -557,6 +571,20 @@ def set_agent_quota(tg_id: int, limit_bytes: int):
         usage_sync.sync_agent_now(tg_id)
     except Exception as e:
         log.warning("sync_agent_now failed for %s: %s", tg_id, e)
+
+def set_agent_user_limit(tg_id: int, max_users: int):
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            "UPDATE agents SET user_limit=%s WHERE telegram_user_id=%s",
+            (int(max_users), tg_id),
+        )
+
+def set_agent_max_user_bytes(tg_id: int, max_bytes: int):
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            "UPDATE agents SET max_user_bytes=%s WHERE telegram_user_id=%s",
+            (int(max_bytes), tg_id),
+        )
 
 def renew_agent_days(tg_id: int, add_days: int):
     # if no expire_at -> set now + days; else add days
@@ -594,14 +622,29 @@ def set_agent_panels(agent_tg_id: int, panel_ids: set[int]):
 # ---------- UI ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    header = ""
+    if not is_admin(uid):
+        ag = get_agent(uid)
+        if ag:
+            limit_b = int(ag.get("plan_limit_bytes") or 0)
+            max_users = int(ag.get("user_limit") or 0)
+            max_user_b = int(ag.get("max_user_bytes") or 0)
+            user_cnt = count_local_users(uid)
+            exp = ag.get("expire_at")
+            parts = [f"👤 <b>{ag['name']}</b>", f"👥 Users: {user_cnt}/{('∞' if max_users==0 else max_users)}"]
+            if limit_b:
+                parts.append(f"📦 Quota: {fmt_bytes_short(limit_b)}")
+            if max_user_b:
+                parts.append(f"📛 Max/User: {fmt_bytes_short(max_user_b)}")
+            if exp:
+                parts.append(f"⏳ Expire: {exp.strftime('%Y-%m-%d')}")
+            header = "\n".join(parts) + "\n\n"
     if is_admin(uid):
         kb = [
-            [InlineKeyboardButton("➕ Add Panel", callback_data="add_panel")],
-            [InlineKeyboardButton("🛠️ Manage Panels", callback_data="manage_panels")],
-            [InlineKeyboardButton("👑 Manage Agents", callback_data="manage_agents")],
             [InlineKeyboardButton("🧬 New Local User", callback_data="new_user")],
             [InlineKeyboardButton("🔍 Search User", callback_data="search_user")],
             [InlineKeyboardButton("👥 List Users", callback_data="list_users:0")],
+            [InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")],
         ]
     else:
         kb = [
@@ -609,10 +652,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🔍 Search User", callback_data="search_user")],
             [InlineKeyboardButton("👥 List Users", callback_data="list_users:0")],
         ]
+    text = header + "Choose an option:"
     if update.message:
-        await update.message.reply_text("Choose an option:", reply_markup=InlineKeyboardMarkup(kb))
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     else:
-        await update.callback_query.edit_message_text("Choose an option:", reply_markup=InlineKeyboardMarkup(kb))
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
 
 def _panel_select_kb(panels, selected: set, mode: str):
     rows = []
@@ -693,6 +737,19 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data
     uid = update.effective_user.id
+
+    if data == "admin_panel":
+        if not is_admin(uid):
+            await q.edit_message_text("دسترسی ندارید.")
+            return ConversationHandler.END
+        kb = [
+            [InlineKeyboardButton("➕ Add Panel", callback_data="add_panel")],
+            [InlineKeyboardButton("🛠️ Manage Panels", callback_data="manage_panels")],
+            [InlineKeyboardButton("👑 Manage Agents", callback_data="manage_agents")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="back_home")],
+        ]
+        await q.edit_message_text("پنل ادمین:", reply_markup=InlineKeyboardMarkup(kb))
+        return ConversationHandler.END
 
     # --- admin/agent shared
     if data == "add_panel":
@@ -871,6 +928,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(uid): return ConversationHandler.END
         await q.edit_message_text("حجم کل نماینده (مثلا 200GB یا 0=نامحدود):")
         return ASK_AGENT_LIMIT
+
+    if data == "agent_set_user_limit":
+        if not is_admin(uid): return ConversationHandler.END
+        await q.edit_message_text("حداکثر تعداد یوزر (0=نامحدود):")
+        return ASK_AGENT_MAX_USERS
+
+    if data == "agent_set_max_user":
+        if not is_admin(uid): return ConversationHandler.END
+        await q.edit_message_text("حداکثر حجم هر یوزر (مثلا 50GB یا 0=نامحدود):")
+        return ASK_AGENT_MAX_USER_GB
 
     if data == "agent_renew_days":
         if not is_admin(uid): return ConversationHandler.END
@@ -1272,11 +1339,16 @@ async def show_agent_card(q, context: ContextTypes.DEFAULT_TYPE, agent_tg_id: in
     limit_b = int(a.get("plan_limit_bytes") or 0)
     exp = a.get("expire_at")
     active = bool(a.get("active", 1))
+    max_users = int(a.get("user_limit") or 0)
+    max_user_b = int(a.get("max_user_bytes") or 0)
+    user_cnt = count_local_users(agent_tg_id)
     lines = []
     if notice: lines.append(notice)
     lines += [
         f"👤 <b>{a['name']}</b> (TG: <code>{a['telegram_user_id']}</code>)",
         f"📦 Agent Quota: <b>{'Unlimited' if limit_b==0 else fmt_bytes_short(limit_b)}</b>",
+        f"👥 Users: <b>{user_cnt}</b> / <b>{'Unlimited' if max_users==0 else max_users}</b>",
+        f"📛 Max/User: <b>{'Unlimited' if max_user_b==0 else fmt_bytes_short(max_user_b)}</b>",
         f"⏳ Agent Expire: <b>{(exp.strftime('%Y-%m-%d %H:%M:%S UTC') if exp else '—')}</b>",
         f"✅ Active: <b>{'Yes' if active else 'No'}</b>",
         "",
@@ -1284,6 +1356,8 @@ async def show_agent_card(q, context: ContextTypes.DEFAULT_TYPE, agent_tg_id: in
     ]
     kb = [
         [InlineKeyboardButton("✏️ Set Quota", callback_data="agent_set_quota")],
+        [InlineKeyboardButton("👥 Set User Limit", callback_data="agent_set_user_limit")],
+        [InlineKeyboardButton("📛 Set Max/User", callback_data="agent_set_max_user")],
         [InlineKeyboardButton("🔁 Renew (days)", callback_data="agent_renew_days")],
         [InlineKeyboardButton("🧩 Assign Panels", callback_data="agent_assign_panels")],
         [InlineKeyboardButton("🔘 Toggle Active", callback_data="agent_toggle_active")],
@@ -1550,17 +1624,64 @@ async def got_agent_renew_days(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text(*a, **k)
     return await show_agent_card(Fake(), context, a, notice=f"✅ {days} روز به انقضا اضافه شد.")
 
+async def got_agent_user_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    a = context.user_data.get("agent_tg_id") or 0
+    try:
+        num = int((update.message.text or "0").strip())
+        assert num >= 0
+    except Exception:
+        await update.message.reply_text("❌ یک عدد صحیح بفرست (مثلا 100 یا 0).")
+        return ASK_AGENT_MAX_USERS
+    set_agent_user_limit(a, num)
+    class Fake:
+        async def edit_message_text(self, *a, **k):
+            await update.message.reply_text(*a, **k)
+    return await show_agent_card(Fake(), context, a, notice="✅ محدودیت تعداد ذخیره شد.")
+
+async def got_agent_max_user_gb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    a = context.user_data.get("agent_tg_id") or 0
+    limit_b = parse_human_size(update.message.text or "0")
+    set_agent_max_user_bytes(a, limit_b)
+    class Fake:
+        async def edit_message_text(self, *a, **k):
+            await update.message.reply_text(*a, **k)
+    return await show_agent_card(Fake(), context, a, notice="✅ حداکثر حجم هر یوزر ذخیره شد.")
+
 # ---------- new user flow ----------
 async def got_newuser_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_username"] = (update.message.text or "").strip()
     if not context.user_data["new_username"]:
         await update.message.reply_text("❌ خالیه. دوباره بفرست:")
         return ASK_NEWUSER_NAME
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        ag = get_agent(uid) or {}
+        limit = int(ag.get("user_limit") or 0)
+        max_user_bytes = int(ag.get("max_user_bytes") or 0)
+        context.user_data["agent_max_user_bytes"] = max_user_bytes
+        if limit > 0:
+            total = count_local_users(uid)
+            exists = get_local_user(uid, context.user_data["new_username"])
+            if not exists and total >= limit:
+                await update.message.reply_text("❌ به حد مجاز تعداد کاربران رسیده‌اید.")
+                return ConversationHandler.END
+    else:
+        context.user_data["agent_max_user_bytes"] = 0
     await update.message.reply_text("حجم در GB (0=نامحدود):")
     return ASK_LIMIT_GB
 
 async def got_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["limit_bytes"] = gb_to_bytes(update.message.text or "0")
+    limit_b = gb_to_bytes(update.message.text or "0")
+    max_b = int(context.user_data.get("agent_max_user_bytes") or 0)
+    if max_b > 0 and limit_b > max_b:
+        await update.message.reply_text(
+            f"❌ حداکثر حجم مجاز {fmt_bytes_short(max_b)} است. دوباره بفرست:")
+        return ASK_LIMIT_GB
+    context.user_data["limit_bytes"] = limit_b
     await update.message.reply_text("مدت استفاده به روز (مثلا 30):")
     return ASK_DURATION
 
@@ -2012,6 +2133,8 @@ def build_app():
             ASK_AGENT_TGID:        [MessageHandler(filters.TEXT & ~filters.COMMAND, got_agent_tgid)],
             ASK_AGENT_LIMIT:       [MessageHandler(filters.TEXT & ~filters.COMMAND, got_agent_limit)],
             ASK_AGENT_RENEW_DAYS:  [MessageHandler(filters.TEXT & ~filters.COMMAND, got_agent_renew_days)],
+            ASK_AGENT_MAX_USERS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_agent_user_limit)],
+            ASK_AGENT_MAX_USER_GB: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_agent_max_user_gb)],
 
             # user creation
             ASK_NEWUSER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_newuser_name)],
