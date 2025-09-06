@@ -127,6 +127,7 @@ def canonical_owner_id(owner_id: int) -> int:
     ASK_EDIT_PANEL_NAME, ASK_EDIT_PANEL_USER, ASK_EDIT_PANEL_PASS,
     ASK_SELECT_PANELS,
     ASK_PANEL_SUB_URL,
+    ASK_SERVICE_NAME,
 
     # agent mgmt
     ASK_AGENT_NAME, ASK_AGENT_TGID,
@@ -134,7 +135,7 @@ def canonical_owner_id(owner_id: int) -> int:
     ASK_AGENT_MAX_USERS, ASK_AGENT_MAX_USER_GB,
     ASK_ASSIGN_AGENT_PANELS,
     ASK_PANEL_REMOVE_CONFIRM,
-) = range(25)
+) = range(26)
 
 # ---------- MySQL ----------
 MYSQL_POOL = None
@@ -952,6 +953,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
         kb = [
             [InlineKeyboardButton("➕ Add Panel", callback_data="add_panel")],
+            [InlineKeyboardButton("🧩 Add Service", callback_data="service_add")],
             [InlineKeyboardButton("🛠️ Manage Panels", callback_data="manage_panels")],
             [InlineKeyboardButton("👑 Manage Agents", callback_data="manage_agents")],
             [InlineKeyboardButton("⬅️ Back", callback_data="back_home")],
@@ -966,6 +968,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
         await q.edit_message_text("🧾 اسم پنل را بفرست:")
         return ASK_PANEL_NAME
+
+    if data == "service_add":
+        if not is_admin(uid):
+            await q.edit_message_text("فقط ادمین می‌تواند سرویس بسازد.")
+            return ConversationHandler.END
+        await q.edit_message_text("اسم سرویس را بفرست:")
+        return ASK_SERVICE_NAME
 
     if data == "manage_panels":
         if not is_admin(uid):
@@ -2345,16 +2354,18 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
 
 
 # ---------- services ----------
-async def add_service_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Create a new service (admin only)."""
+async def got_service_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create a new service after receiving its name."""
     if not is_admin(update.effective_user.id):
-        return
-    name = " ".join(context.args or [])
+        await update.message.reply_text("دسترسی ندارید.")
+        return ConversationHandler.END
+    name = (update.message.text or "").strip()
     if not name:
-        await update.message.reply_text("Usage: /addservice <name>")
-        return
+        await update.message.reply_text("❌ اسم معتبر بفرست:")
+        return ASK_SERVICE_NAME
     sid = services.create_service(name, canonical_owner_id(update.effective_user.id))
     await update.message.reply_text(f"Service created with id {sid}")
+    return ConversationHandler.END
 
 # ---------- wiring ----------
 def build_app():
@@ -2384,6 +2395,7 @@ def build_app():
             ASK_EDIT_PANEL_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_edit_panel_user)],
             ASK_EDIT_PANEL_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_edit_panel_pass)],
             ASK_PANEL_SUB_URL:  [MessageHandler(filters.TEXT & ~filters.COMMAND, got_panel_sub_url)],
+            ASK_SERVICE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_service_name)],
             ASK_PANEL_REMOVE_CONFIRM: [CallbackQueryHandler(on_button)],
 
             # agent mgmt (admin)
@@ -2412,7 +2424,6 @@ def build_app():
         allow_reentry=True,
     )
     app.add_handler(conv)
-    app.add_handler(CommandHandler("addservice", add_service_cmd))
     return app
 
 if __name__ == "__main__":
