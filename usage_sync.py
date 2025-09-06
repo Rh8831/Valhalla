@@ -7,13 +7,13 @@ import logging
 from urllib.parse import urljoin
 from datetime import datetime, timezone
 
-import requests
 from dotenv import load_dotenv
 from mysql.connector import pooling
 import mysql.connector
 
 import marzneshin
 import marzban
+import sanaei
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | usage_sync | %(message)s",
@@ -26,6 +26,7 @@ POOL = None
 API_MODULES = {
     "marzneshin": marzneshin,
     "marzban": marzban,
+    "sanaei": sanaei,
 }
 
 
@@ -124,6 +125,14 @@ def fetch_used_traffic(panel_type, panel_url, bearer, remote_username):
     """Return used traffic for a remote user via appropriate panel API."""
     try:
         api = get_api(panel_type)
+        if panel_type == "sanaei" and "," in remote_username:
+            total = 0
+            for rn in [r.strip() for r in remote_username.split(",") if r.strip()]:
+                obj, err = api.get_user(panel_url, bearer, rn)
+                if not obj:
+                    return None, f"{panel_url}: {err or 'user not found'}"
+                total += int(obj.get("used_traffic", 0) or 0)
+            return total, None
         obj, err = api.get_user(panel_url, bearer, remote_username)
         if not obj:
             return None, f"{panel_url}: {err or 'user not found'}"
@@ -178,14 +187,26 @@ def mark_user_disabled(owner_id, local_username):
 
 def disable_remote(panel_type, panel_url, token, remote_username):
     api = get_api(panel_type)
-    ok, msg = api.disable_remote_user(panel_url, token, remote_username)
-    return (200 if ok else None), msg
+    remotes = remote_username.split(",") if panel_type == "sanaei" else [remote_username]
+    all_ok, last_msg = True, None
+    for rn in remotes:
+        ok, msg = api.disable_remote_user(panel_url, token, rn)
+        if not ok:
+            all_ok = False
+            last_msg = msg
+    return (200 if all_ok else None), last_msg
 
 
 def enable_remote(panel_type, panel_url, token, remote_username):
     api = get_api(panel_type)
-    ok, msg = api.enable_remote_user(panel_url, token, remote_username)
-    return (200 if ok else None), msg
+    remotes = remote_username.split(",") if panel_type == "sanaei" else [remote_username]
+    all_ok, last_msg = True, None
+    for rn in remotes:
+        ok, msg = api.enable_remote_user(panel_url, token, rn)
+        if not ok:
+            all_ok = False
+            last_msg = msg
+    return (200 if all_ok else None), last_msg
 
 def mark_user_enabled(owner_id, local_username):
     with CurCtx() as cur:
