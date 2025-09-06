@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>پنل سرویس - {{ user.username }}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet"/>
+  <script>
+    tailwind.config = { theme: { extend: { fontFamily: { sans: ['Vazirmatn','ui-sans-serif','system-ui'] } } } }
+  </script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;600;700;800&display=swap');
+
+    :root{
+      --bg-top:#3a4048; --bg-mid:#2d3239; --bg-btm:#1d2026;
+      --surface:linear-gradient(to bottom,#3C3F48,#1C1F24);
+      --surface2:rgba(255,255,255,.06);
+      --track:#2b2f36; --text:#f1f1f2; --muted:#94969a;
+      --g1:#71F466; --g2:#08AC4B;
+    }
+
+    body{
+      font-family:'Vazirmatn',sans-serif; color:var(--text);
+      background:linear-gradient(180deg,var(--bg-top) 0%,var(--bg-mid) 38%,var(--bg-btm) 100%);
+      min-height:100vh;
+    }
+
+    .card{ background:var(--surface); border-radius:1.25rem; }
+    .card-inner{ background:var(--surface2); border-radius:.95rem; }
+
+    .gbtn{
+      background:linear-gradient(90deg,var(--g1),var(--g2));
+      color:#0b1a12; font-weight:800; border-radius:999px;
+      box-shadow:0 12px 26px -12px rgba(113,244,102,.55);
+      transition:filter .2s;
+    }
+    .gbtn:hover{ filter:brightness(1.06); }
+
+    .status-pill{
+      background:linear-gradient(90deg,rgba(113,244,102,.15),rgba(8,172,75,.15));
+      color:#86f5a5; border:1px solid rgba(113,244,102,.25);
+      display:inline-flex; align-items:center; gap:.45rem; padding:.45rem .9rem;
+      border-radius:999px; font-weight:700;
+    }
+    .status-pill .dot{ width:.5rem;height:.5rem;border-radius:999px;background:var(--g1); box-shadow:0 0 0 .18rem rgba(113,244,102,.18); }
+
+    /* Semi-circle gauges (no halo) */
+    .semi-gauge{ width:260px; height:150px; position:relative; }
+    .semi-gauge svg{ width:100%; height:100%; display:block; }
+    .semi-gauge .track{ fill:none; stroke:var(--track); stroke-width:16; opacity:.35; stroke-linecap:round; }
+    .semi-gauge .progress{ fill:none; stroke:url(#semi-grad); stroke-width:16; stroke-linecap:round; transition:stroke-dashoffset .7s ease; }
+    .semi-gauge .center{ position:absolute; left:0; right:0; top:50%; transform:translateY(-6%); text-align:center; line-height:1.1; }
+    .semi-gauge .num{ font-size:2.2rem; font-weight:800; }
+    .semi-gauge .num.pop{ animation: pop .35s ease; }
+    .semi-gauge .lbl{ font-size:.9rem; color:var(--muted); margin-top:.25rem; }
+    .gauges-wrap{ background:transparent!important; box-shadow:none!important; border:none!important; }
+
+    .tab{ background:var(--surface2); color:var(--muted); border-radius:.9rem; padding:.6rem 1rem; font-weight:600; white-space:nowrap; transition:transform .15s ease, background .2s; cursor:pointer; }
+    .tab.active{ background:linear-gradient(90deg,var(--g1),var(--g2)); color:#0b1a12; box-shadow:0 8px 20px -10px rgba(113,244,102,.55); transform:translateY(-1px); }
+
+    .row{ background:var(--surface2); border-radius:1rem; padding:1rem; overflow:hidden; transition:background .2s ease; }
+    .row:hover{ background:rgba(255,255,255,.08); }
+
+    .howto .help{ background:linear-gradient(90deg, rgba(113,244,102,.12), rgba(8,172,75,.12)); border:1px solid rgba(113,244,102,.25);
+      border-radius:.9rem; padding:.85rem 1rem; }
+
+    .info-panel{ background:var(--surface2); border-radius:1rem; padding:1.25rem; margin-top:1.5rem; }
+    .info-row{ display:flex; justify-content:space-between; gap:1rem; align-items:center; padding:.6rem 0; border-bottom:1px solid rgba(255,255,255,0.08); }
+    .info-row:last-child{ border-bottom:none; }
+
+    .btn-secondary{ background:var(--surface2); color:var(--text); border-radius:.75rem; padding:.5rem 1rem; transition:transform .12s ease, background .2s; white-space:nowrap; }
+    .btn-secondary:hover{ background:#444851; }
+
+    .under{ margin-top:1.25rem; display:flex; justify-content:center; }
+
+    /* keep “number + unit” order in RTL */
+    .num-unit{ direction:ltr; unicode-bidi:plaintext; }
+
+    /* clicks + ripples */
+    .pressable{ position:relative; overflow:hidden; will-change:transform; }
+    .pressable:active{ transform:scale(.98); }
+
+    .ripple{
+      position:absolute; border-radius:9999px; transform:scale(0);
+      background:rgba(255,255,255,.35); pointer-events:none; animation:ripple .6s ease-out forwards;
+      mix-blend-mode: screen;
+    }
+
+    /* HOVER LIFT (cards/rows/buttons/tabs) */
+    @media (hover:hover) and (pointer:fine){
+      .hover-lift{ transition: transform .22s cubic-bezier(.2,.8,.2,1), box-shadow .22s; will-change: transform; }
+      .hover-lift:hover{ transform: translateY(-2px) scale(1.02); box-shadow: 0 14px 36px rgba(0,0,0,.28); }
+
+      .hover-lift-soft{ transition: transform .24s cubic-bezier(.2,.8,.2,1), box-shadow .24s; will-change: transform; }
+      .hover-lift-soft:hover{ transform: translateY(-1px) scale(1.01); box-shadow: 0 10px 28px rgba(0,0,0,.22); }
+    }
+
+    .fade-in-up{ animation:fadeInUp .35s ease both; }
+
+    @keyframes ripple{ to{ transform:scale(1); opacity:0; } }
+    @keyframes fadeInUp{ from{ opacity:0; transform:translateY(8px); } to{ opacity:1; transform:translateY(0); } }
+    @keyframes pop{ 0%{ transform:scale(.9); } 60%{ transform:scale(1.04); } 100%{ transform:scale(1); } }
+
+    @media (prefers-reduced-motion: reduce){
+      .pressable:active{ transform:none; }
+      .ripple, .fade-in-up, .semi-gauge .num.pop{ animation:none!important; }
+      .row, .btn-secondary, .tab, .hover-lift, .hover-lift-soft{ transition:none!important; }
+    }
+
+    /* --- جزئیات با انیمیشن باز/بسته + چرخش آیکن --- */
+    details .chev{ transition: transform .25s ease; }
+    details[open] .chev{ transform: rotate(180deg); }
+
+    details .anim{
+      max-height: 0;
+      overflow: hidden;
+      transition: max-height .3s ease, opacity .25s ease;
+      opacity: 0.0;
+    }
+    details[open] .anim{
+      max-height: 800px; /* کافی برای محتوای کوتاه */
+      opacity: 1;
+    }
+
+    /* مخفی‌سازی محتوای پلتفرم‌ها هنگام سوییچ تب‌ها */
+    .platform-pane{ display:none; }
+    .platform-pane.active{ display:block; }
+  </style>
+</head>
+<body>
+  <div class="under fade-in-up">
+    <span class="status-pill">
+      <span class="dot"></span>
+      {% if not user.enabled %}سرویس غیرفعال{% elif user.expired %}اشتراک پایان یافته{% elif user.data_limit_reached %}حجم تمام شده{% elif user.is_active %}این سرویس فعال است{% else %}این سرویس فعال است{% endif %}
+    </span>
+  </div>
+
+  <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+    <!-- MAIN CARD -->
+    <section class="card p-5 sm:p-6 mt-2 fade-in-up hover-lift-soft">
+      <div class="gauges-wrap grid grid-cols-1 sm:grid-cols-2 gap-8 place-items-center">
+        <div class="semi-gauge" id="g-time" data-value="0" data-total="30" data-label="روز باقی‌مانده">
+          <svg viewBox="0 0 220 120" aria-hidden="true">
+            <defs>
+              <linearGradient id="semi-grad" x1="10" y1="20" x2="210" y2="20" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="var(--g1)"/><stop offset="100%" stop-color="var(--g2)"/>
+              </linearGradient>
+            </defs>
+            <path class="track" d="M 20 100 A 90 90 0 0 1 200 100"/>
+            <path class="progress" d="M 20 100 A 90 90 0 0 1 200 100"/>
+          </svg>
+          <div class="center"><div class="num" id="num-time">—</div><div class="lbl" id="lbl-time">روز باقی‌مانده</div></div>
+        </div>
+
+        <div class="semi-gauge" id="g-data" data-value="0" data-total="100" data-label="حجم باقی‌مانده">
+          <svg viewBox="0 0 220 120" aria-hidden="true">
+            <defs>
+              <linearGradient id="semi-grad-2" x1="10" y1="20" x2="210" y2="20" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="var(--g1)"/><stop offset="100%" stop-color="var(--g2)"/>
+              </linearGradient>
+            </defs>
+            <path class="track" d="M 20 100 A 90 90 0 0 1 200 100"/>
+            <path class="progress" style="stroke:url(#semi-grad-2)" d="M 20 100 A 90 90 0 0 1 200 100"/>
+          </svg>
+          <div class="center"><div class="num" id="num-data">—</div><div class="lbl" id="lbl-data">حجم باقی‌مانده</div></div>
+        </div>
+      </div>
+
+      <div class="info-panel fade-in-up" style="animation-delay:.05s">
+        <div class="info-row"><div style="color:var(--muted)">نام کاربری</div><div class="font-semibold">{{ user.username }}</div></div>
+        <div class="info-row"><div style="color:var(--muted)">مصرف کل</div><div class="font-semibold"><span class="num-unit">{{ user.used_traffic | bytesformat }}</span></div></div>
+        <div class="info-row"><div style="color:var(--muted)">پایان اشتراک</div><div class="font-semibold"><span id="expire-jalali">—</span></div></div>
+      </div>
+
+      <div class="mt-5">
+        <button id="copySubUrl" class="gbtn w-full py-3 rounded-full pressable hover-lift"><i class="fa-solid fa-link ml-2"></i> دریافت لینک اشتراک‌گذاری</button>
+      </div>
+    </section>
+
+    <!-- HOW-TO -->
+    <section class="card howto p-5 sm:p-6 mt-6 fade-in-up hover-lift-soft" style="animation-delay:.05s">
+      <h2 class="text-lg font-extrabold">چطور استفاده کنم؟</h2>
+      <p class="text-sm mt-1" style="color:var(--muted)">با استفاده از منوهای زیر نسبت به سیستم عامل خود می‌توانید از اشتراک خود استفاده کنید.</p>
+
+      <div class="mt-4 flex flex-wrap gap-2" id="platform-tabs">
+        <button class="tab active pressable hover-lift" type="button" data-target="android"><i class="fab fa-android ml-1"></i>اندروید</button>
+        <button class="tab pressable hover-lift" type="button" data-target="windows"><i class="fab fa-windows ml-1"></i>ویندوز</button>
+        <button class="tab pressable hover-lift" type="button" data-target="ios"><i class="fab fa-apple ml-1"></i>آیفون</button>
+      </div>
+
+      <!-- ANDROID -->
+      <div id="platform-android" class="platform-pane active">
+        <div class="row mt-4 flex items-center gap-4 hover-lift-soft">
+          <div class="w-12 h-12 rounded-xl flex items-center justify-center shrink-0" style="background:rgba(255,255,255,.08)">
+            <i class="fa-solid fa-signal text-xl" style="color:var(--g1)"></i>
+          </div>
+          <div class="flex-1 min-w-0">
+            <div class="font-semibold truncate" title="هیدیفای">هیدیفای</div>
+          </div>
+          <div class="flex gap-2 shrink-0">
+            <a class="btn-secondary pressable hover-lift" href="https://github.com/hiddify/hiddify-next/releases/latest/download/Hiddify-Android-universal.apk" target="_blank" rel="noopener"><i class="fa-solid fa-download ml-1"></i>دانلود</a>
+          </div>
+        </div>
+
+        <div class="mt-3 grid gap-2">
+          <!-- V2RayNG -->
+          <details class="row hover-lift-soft">
+            <summary class="cursor-pointer select-none font-semibold flex items-center justify-between">
+              <span>V2RayNG</span><i class="fa-solid fa-chevron-down text-xs chev" style="color:var(--muted)"></i>
+            </summary>
+            <div class="anim mt-3 text-sm" style="color:var(--muted)">
+              <ol class="list-decimal list-inside space-y-1">
+                <li>اپلیکیشن V2RayNG را از فروشگاه دانلود کنید.</li>
+                <li>روی دکمه «کپی» در بخش «کانفیگ‌های من» بزنید.</li>
+                <li>در V2RayNG روی + بزنید و «Import from clipboard» را انتخاب کنید.</li>
+                <li>کانفیگ را انتخاب و اتصال را شروع کنید.</li>
+              </ol>
+            </div>
+          </details>
+
+          <!-- V2RayTun -->
+          <details class="row hover-lift-soft">
+            <summary class="cursor-pointer select-none font-semibold flex items-center justify-between">
+              <span>V2RayTun</span><i class="fa-solid fa-chevron-down text-xs chev" style="color:var(--muted)"></i>
+            </summary>
+            <div class="anim mt-3 text-sm" style="color:var(--muted)">
+              <ol class="list-decimal list-inside space-y-1">
+                <li>اپلیکیشن V2RayTun را نصب کنید.</li>
+                <li>در «کانفیگ‌های من» دکمه «کپی» را بزنید و داخل برنامه Paste کنید.</li>
+                <li>اتصال را فعال کنید.</li>
+              </ol>
+            </div>
+          </details>
+
+          <div class="help mt-1 flex items-start gap-3 hover-lift-soft">
+            <i class="fa-solid fa-circle-exclamation mt-0.5" style="color:var(--g1)"></i>
+            <div class="text-sm">اگر مشکلی دارید به ادمین مراجعه کنید.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- WINDOWS -->
+      <div id="platform-windows" class="platform-pane">
+        <div class="mt-4 grid gap-2">
+          <!-- nekoray -->
+          <div class="row flex items-center justify-between gap-4 hover-lift-soft">
+            <div class="flex items-center gap-3 min-w-0">
+              <div class="w-12 h-12 rounded-xl flex items-center justify-center shrink-0" style="background:rgba(255,255,255,.08)">
+                <i class="fa-solid fa-desktop text-xl" style="color:var(--g1)"></i>
+              </div>
+              <div class="min-w-0">
+                <div class="font-semibold truncate" title="Nekoray">Nekoray</div>
+                <div class="text-xs" style="color:var(--muted)">Windows</div>
+              </div>
+            </div>
+            <div class="flex gap-2 shrink-0">
+              <a class="btn-secondary pressable hover-lift" href="https://github.com/MatsuriDayo/nekoray/releases/download/3.8/nekoray-3.8-2023-06-14-windows64.zip" target="_blank" rel="noopener">
+                <i class="fa-solid fa-download ml-1"></i>دانلود
+              </a>
+            </div>
+          </div>
+
+          <!-- v2rayN -->
+          <div class="row flex items-center justify-between gap-4 hover-lift-soft">
+            <div class="flex items-center gap-3 min-w-0">
+              <div class="w-12 h-12 rounded-xl flex items-center justify-center shrink-0" style="background:rgba(255,255,255,.08)">
+                <i class="fa-solid fa-desktop text-xl" style="color:var(--g1)"></i>
+              </div>
+              <div class="min-w-0">
+                <div class="font-semibold truncate" title="v2rayN">v2rayN</div>
+                <div class="text-xs" style="color:var(--muted)">Windows</div>
+              </div>
+            </div>
+            <div class="flex gap-2 shrink-0">
+              <a class="btn-secondary pressable hover-lift" href="https://github.com/2dust/v2rayN/releases/download/6.27/zz_v2rayN-With-Core-SelfContained.7z" target="_blank" rel="noopener">
+                <i class="fa-solid fa-download ml-1"></i>دانلود
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- IOS -->
+      <div id="platform-ios" class="platform-pane">
+        <div class="mt-4 grid gap-2">
+          <!-- Streisand -->
+          <div class="row flex items-center justify-between gap-4 hover-lift-soft">
+            <div class="flex items-center gap-3 min-w-0">
+              <div class="w-12 h-12 rounded-xl flex items-center justify-center shrink-0" style="background:rgba(255,255,255,.08)">
+                <i class="fa-brands fa-apple text-xl" style="color:var(--g1)"></i>
+              </div>
+              <div class="min-w-0">
+                <div class="font-semibold truncate" title="Streisand">Streisand</div>
+                <div class="text-xs" style="color:var(--muted)">iOS</div>
+              </div>
+            </div>
+            <div class="flex gap-2 shrink-0">
+              <a class="btn-secondary pressable hover-lift" href="https://apps.apple.com/us/app/streisand/id6450534064" target="_blank" rel="noopener">
+                <i class="fa-solid fa-download ml-1"></i>لینک دانلود
+              </a>
+            </div>
+          </div>
+
+          <!-- FoXray -->
+          <div class="row flex items-center justify-between gap-4 hover-lift-soft">
+            <div class="flex items-center gap-3 min-w-0">
+              <div class="w-12 h-12 rounded-xl flex items-center justify-center shrink-0" style="background:rgba(255,255,255,.08)">
+                <i class="fa-brands fa-apple text-xl" style="color:var(--g1)"></i>
+              </div>
+              <div class="min-w-0">
+                <div class="font-semibold truncate" title="FoXray">FoXray</div>
+                <div class="text-xs" style="color:var(--muted)">iOS</div>
+              </div>
+            </div>
+            <div class="flex gap-2 shrink-0">
+              <a class="btn-secondary pressable hover-lift" href="https://apps.apple.com/us/app/foxray/id6448898396" target="_blank" rel="noopener">
+                <i class="fa-solid fa-download ml-1"></i>لینک دانلود
+              </a>
+            </div>
+          </div>
+
+          <!-- V2Box -->
+          <div class="row flex items-center justify-between gap-4 hover-lift-soft">
+            <div class="flex items-center gap-3 min-w-0">
+              <div class="w-12 h-12 rounded-xl flex items-center justify-center shrink-0" style="background:rgba(255,255,255,.08)">
+                <i class="fa-brands fa-apple text-xl" style="color:var(--g1)"></i>
+              </div>
+              <div class="min-w-0">
+                <div class="font-semibold truncate" title="V2Box">V2Box</div>
+                <div class="text-xs" style="color:var(--muted)">iOS</div>
+              </div>
+            </div>
+            <div class="flex gap-2 shrink-0">
+              <a class="btn-secondary pressable hover-lift" href="https://apps.apple.com/us/app/v2box-v2ray-client/id6446814690" target="_blank" rel="noopener">
+                <i class="fa-solid fa-download ml-1"></i>لینک دانلود
+              </a>
+            </div>
+          </div>
+
+          <!-- Shadowrocket -->
+          <div class="row flex items-center justify-between gap-4 hover-lift-soft">
+            <div class="flex items-center gap-3 min-w-0">
+              <div class="w-12 h-12 rounded-xl flex items-center justify-center shrink-0" style="background:rgba(255,255,255,.08)">
+                <i class="fa-brands fa-apple text-xl" style="color:var(--g1)"></i>
+              </div>
+              <div class="min-w-0">
+                <div class="font-semibold truncate" title="Shadowrocket">Shadowrocket</div>
+                <div class="text-xs" style="color:var(--muted)">iOS</div>
+              </div>
+            </div>
+            <div class="flex gap-2 shrink-0">
+              <a class="btn-secondary pressable hover-lift" href="https://apps.apple.com/ca/app/shadowrocket/id932747118" target="_blank" rel="noopener">
+                <i class="fa-solid fa-download ml-1"></i>لینک دانلود
+              </a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- DETAILS -->
+    <section class="card p-5 sm:p-6 mt-6 fade-in-up hover-lift-soft" style="animation-delay:.1s">
+      <h2 class="text-lg font-extrabold">مشخصات سرویس</h2>
+      <div class="info-panel mt-4">
+        <div class="info-row">
+          <div style="color:var(--muted)">حجم سرویس</div>
+          <div class="font-semibold">
+            {% if not user.data_limit %}∞{% else %}<span class="num-unit">{{ user.data_limit | bytesformat }}</span>{% endif %}
+          </div>
+        </div>
+        <div class="info-row">
+          <div style="color:var(--muted)">مصرف کل</div>
+          <div class="font-semibold"><span class="num-unit">{{ user.used_traffic | bytesformat }}</span></div>
+        </div>
+        <div class="info-row">
+          <div style="color:var(--muted)">پایان اشتراک (جلالی)</div>
+          <div class="font-semibold"><span id="expire-jalali-2">—</span></div>
+        </div>
+        <div class="info-row">
+          <div style="color:var(--muted)">ریست حجم</div>
+          <div class="font-semibold" id="reset-text">—</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- CONFIGS -->
+    <section class="card p-5 sm:p-6 mt-6 fade-in-up hover-lift-soft" style="animation-delay:.15s">
+      <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+        <h2 class="text-lg font-extrabold">کانفیگ‌های من</h2>
+        <div class="flex gap-2 shrink-0">
+          <button id="copyAll" class="btn-secondary pressable hover-lift" type="button"><i class="fa-regular fa-copy ml-1"></i>کپی همه</button>
+        </div>
+      </div>
+
+      <p class="text-sm mt-2" style="color:var(--muted)">در اینجا شما به کانفیگ‌های خود به طور جداگانه دسترسی دارید و می‌توانید هر یک را کپی کنید.</p>
+
+      <div id="configs-list" class="mt-4 space-y-2">
+        <div class="row flex items-center justify-between gap-4 hover-lift-soft" data-empty>
+          <div class="flex items-center gap-3 min-w-0">
+            <div class="w-8 h-6 rounded flex items-center justify-center shrink-0" style="background:rgba(255,255,255,.08)">
+              <i class="fa-solid fa-signal text-xs" style="color:var(--g1)"></i>
+            </div>
+            <div class="min-w-0">
+              <div class="font-semibold truncate">در حال بارگذاری…</div>
+              <div class="text-xs" style="color:var(--muted)">&nbsp;</div>
+            </div>
+          </div>
+          <div class="flex gap-2 shrink-0">
+            <button disabled class="btn-secondary pressable hover-lift"><i class="fa-regular fa-copy ml-1"></i>کپی</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const SUBSCRIPTION_URL = "{{ user.subscription_url }}";
+    const USED_TRAFFIC_BYTES = (v=>{ try{return parseFloat(v)||0}catch{ return 0 }})("{{ user.used_traffic }}");
+    const DATA_LIMIT_BYTES = (v=>{ try{return (!v || v==='None')?Infinity:parseFloat(v)||Infinity}catch{ return Infinity }})("{{ user.data_limit }}");
+    const EXPIRE_DATE_RAW = "{{ user.expire_date }}";
+    const RESET_STRATEGY = ("{{ user.data_limit_reset_strategy.value }}") || "";
+
+    function formatBytes(bytes, decimals=2){
+      if (bytes === Infinity) return 'نامحدود';
+      if (!isFinite(bytes)) return '—';
+      if (bytes === 0) return '0 B';
+      const k=1024, dm=decimals<0?0:decimals;
+      const sizes=['B','KB','MB','GB','TB','PB','EB','ZB','YB'];
+      const i=Math.floor(Math.log(bytes)/Math.log(k));
+      return parseFloat((bytes/Math.pow(k,i)).toFixed(dm))+' '+sizes[i];
+    }
+    function parseDateSafe(s){
+      if(!s || s==='None' || s==='∞') return null;
+      if (/^\d+$/.test(s)) { const n=parseInt(s,10), ms=(s.length>=13)?n:n*1000; const d=new Date(ms); return isNaN(d.getTime())?null:d; }
+      const d=new Date(s); return isNaN(d.getTime())?null:d;
+    }
+    function remainingDays(exp){ if(!exp) return Infinity; const now=new Date(); const diff=exp-now; return diff<=0?0:Math.ceil(diff/86400000); }
+    function toJalali(gy, gm, gd){
+      function div(a,b){return ~~(a/b)} var g_d_m=[0,31,59,90,120,151,181,212,243,273,304,334];
+      var jy, jm, jd, gy2=(gm>2)?(gy+1):gy;
+      var days=355666+365*gy+div(gy2+3,4)-div(gy2+99,100)+div(gy2+399,400)+gd+g_d_m[gm-1];
+      jy=-1595+33*div(days,12053); days%=12053; jy+=4*div(days,1461); days%=1461;
+      if(days>365){ jy+=div(days-1,365); days=(days-1)%365; }
+      jd=days+1; if(jd<=186){ jm=Math.ceil(jd/31); jd-=31*(jm-1); } else { jm=Math.ceil((jd-186)/30)+6; jd-=186+30*(jm-7); }
+      return [jy,jm,jd];
+    }
+    const monthsFa=["فروردین","اردیبهشت","خرداد","تیر","مرداد","شهریور","مهر","آبان","آذر","دی","بهمن","اسفند"];
+
+    function addRipple(e){
+      const target = e.currentTarget;
+      const rect = target.getBoundingClientRect();
+      const size = Math.max(rect.width, rect.height) * 1.2;
+      const x = e.clientX - rect.left - size/2;
+      const y = e.clientY - rect.top - size/2;
+      const r = document.createElement('span');
+      r.className='ripple';
+      r.style.width = r.style.height = size+'px';
+      r.style.left = x+'px';
+      r.style.top = y+'px';
+      target.appendChild(r);
+      r.addEventListener('animationend', ()=> r.remove());
+    }
+    function flash(el,text){
+      const old=el.innerHTML;
+      el.innerHTML=`<i class="fa-solid fa-check ml-1"></i>${text}`;
+      el.style.background='linear-gradient(90deg, var(--g1), var(--g2))';
+      el.style.color='#0b1a12';
+      setTimeout(()=>{ el.innerHTML=old; el.style.background=''; el.style.color=''; },1400);
+    }
+
+    async function copyText(text){
+      if(navigator.clipboard && window.isSecureContext){
+        return navigator.clipboard.writeText(text);
+      }
+      const ta=document.createElement('textarea');
+      ta.value=text;
+      ta.style.position='fixed';
+      ta.style.top='-1000px';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      try{ document.execCommand('copy'); }finally{ document.body.removeChild(ta); }
+    }
+
+    function initSemiGauge(el, percent){
+      const prog=el.querySelector('.progress'); const len=prog.getTotalLength();
+      prog.style.strokeDasharray=len; prog.style.strokeDashoffset=len*(1-Math.max(0,Math.min(100,percent))/100);
+    }
+    function setupGauges(){
+      const gData=document.getElementById('g-data');
+      const numData=document.getElementById('num-data');
+      const remaining=(DATA_LIMIT_BYTES===Infinity)?Infinity:Math.max(DATA_LIMIT_BYTES-USED_TRAFFIC_BYTES,0);
+      const dataPercent=(DATA_LIMIT_BYTES===Infinity)?100:(remaining/Math.max(1,DATA_LIMIT_BYTES))*100;
+      numData.innerHTML=(remaining===Infinity)?'∞':`<span class="num-unit">${formatBytes(remaining)}</span>`;
+      initSemiGauge(gData, dataPercent);
+      numData.classList.add('pop'); setTimeout(()=>numData.classList.remove('pop'), 360);
+
+      const gTime=document.getElementById('g-time');
+      const numTime=document.getElementById('num-time');
+      const exp=parseDateSafe(EXPIRE_DATE_RAW);
+      if(!exp){ numTime.textContent='∞'; initSemiGauge(gTime,100); }
+      else{
+        const daysLeft=remainingDays(exp); numTime.textContent=String(daysLeft);
+        let cycleDays=30, rs=(RESET_STRATEGY||'').toLowerCase();
+        if(rs.includes('weekly')) cycleDays=7; else if(rs.includes('daily')) cycleDays=1; else if(rs.includes('monthly')) cycleDays=30;
+        const p=Math.max(0,Math.min(100,(Math.min(daysLeft,cycleDays)/cycleDays)*100));
+        initSemiGauge(gTime,p);
+        numTime.classList.add('pop'); setTimeout(()=>numTime.classList.remove('pop'), 360);
+      }
+    }
+
+    function setExpireJalali(){
+      const el1=document.getElementById('expire-jalali');
+      const el2=document.getElementById('expire-jalali-2');
+      const exp=parseDateSafe(EXPIRE_DATE_RAW);
+      if(!exp){ el1.textContent='نامحدود'; if(el2) el2.textContent='نامحدود'; return; }
+      const [jy,jm,jd]=toJalali(exp.getFullYear(), exp.getMonth()+1, exp.getDate());
+      const s=jd+' '+monthsFa[jm-1]+' '+jy; el1.textContent=s; if(el2) el2.textContent=s;
+    }
+    function setResetText(){
+      const t=document.getElementById('reset-text');
+      if(!RESET_STRATEGY || RESET_STRATEGY==='no_reset' || RESET_STRATEGY==='None'){ t.textContent='ندارد'; return; }
+      t.textContent='دارد – '+RESET_STRATEGY;
+    }
+
+    function decodeBase64Maybe(text){
+      try{
+        const b64=text.trim().replace(/-/g,'+').replace(/_/g,'/').replace(/\s/g,'');
+        const decoded=atob(b64);
+        if((decoded.match(/(vmess|vless|trojan|ss):\/\//g)||[]).length) return decoded;
+      }catch(e){}
+      return text;
+    }
+    function parseLine(line){
+      const url=line.trim(); if(!url) return null;
+      if(!/^(vmess|vless|trojan|ss):\/\//i.test(url)) return null;
+      let name='', proto='other';
+      try{
+        if(url.startsWith('vmess://')){
+          proto='vmess'; const payload=url.slice(8); const json=JSON.parse(atob(payload)); name=json.ps||json.add||'VMess';
+        }else if(url.startsWith('vless://')||url.startsWith('trojan://')||url.startsWith('ss://')){
+          proto=url.split('://',1)[0]; const hi=url.indexOf('#'); if(hi>-1){ name=decodeURIComponent(url.slice(hi+1))||proto.toUpperCase(); }
+          else { const host=url.split('@').pop().split(/[:/?#]/)[0]; name=host||proto.toUpperCase(); }
+        }
+      }catch(e){ name=proto.toUpperCase() }
+      return {name, url, proto};
+    }
+    async function fetchConfigs(url){
+      try{
+        const full=/^https?:\/\//i.test(url)?url:(location.origin+url);
+        const res=await fetch(full); if(!res.ok) throw new Error('HTTP '+res.status);
+        const text=await res.text();
+        const content=decodeBase64Maybe(text);
+        return content.split('\n').map(parseLine).filter(Boolean);
+      }catch(e){ console.error('Fetch configs failed:',e); return []; }
+    }
+    function escapeHtml(s){ return s.replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;' }[m])) }
+
+    function renderConfigs(items){
+      const wrap=document.getElementById('configs-list'); wrap.innerHTML='';
+      if(!items.length){
+        wrap.innerHTML=`<div class="row flex items-center justify-between gap-4 fade-in-up hover-lift-soft">
+          <div class="flex items-center gap-3 min-w-0">
+            <div class="w-8 h-6 rounded flex items-center justify-center shrink-0" style="background:rgba(255,255,255,.08)">
+              <i class="fa-solid fa-signal text-xs" style="color:var(--g1)"></i>
+            </div>
+            <div class="min-w-0">
+              <div class="font-semibold truncate">موردی یافت نشد</div>
+              <div class="text-xs" style="color:var(--muted)">لطفاً لینک اشتراک را بررسی کنید</div>
+            </div>
+          </div>
+          <div class="flex gap-2 shrink-0">
+            <a class="btn-secondary pressable hover-lift" href="{{ user.subscription_url }}"><i class="fa-regular fa-copy ml-1"></i>اشتراک</a>
+          </div>
+        </div>`;
+        return;
+      }
+      items.forEach((it, idx)=>{
+        const row=document.createElement('div'); row.className='row flex items-center justify-between gap-4 fade-in-up hover-lift-soft';
+        row.style.animationDelay = (idx*0.035)+'s';
+        row.innerHTML=`
+          <div class="flex items-center gap-3 min-w-0">
+            <div class="w-8 h-6 rounded flex items-center justify-center shrink-0" style="background:rgba(255,255,255,.08)">
+              <i class="fa-solid fa-signal text-xs" style="color:var(--g1)"></i>
+            </div>
+            <div class="min-w-0">
+              <div class="font-semibold truncate" title="${escapeHtml(it.name||'کانفیگ')}">${escapeHtml(it.name||'کانفیگ')}</div>
+              <div class="text-xs" style="color:var(--muted)">${(it.proto||'').toUpperCase()}</div>
+            </div>
+          </div>
+          <div class="flex gap-2 shrink-0">
+            <button class="btn-secondary pressable hover-lift copy"><i class="fa-regular fa-copy ml-1"></i>کپی</button>
+          </div>`;
+        const copyBtn = row.querySelector('.copy');
+        copyBtn.addEventListener('click', async (e)=>{
+          addRipple(e);
+          try{ await copyText(it.url); flash(copyBtn,'کپی شد'); }catch(_){}
+        });
+        wrap.appendChild(row);
+      });
+    }
+
+    function initTabs(){
+      const panes = {
+        android: document.getElementById('platform-android'),
+        windows: document.getElementById('platform-windows'),
+        ios: document.getElementById('platform-ios'),
+      };
+      document.querySelectorAll('#platform-tabs .tab').forEach(b=>{
+        b.addEventListener('click', (e)=>{
+          addRipple(e);
+          const target = b.getAttribute('data-target');
+          // tab active
+          document.querySelectorAll('#platform-tabs .tab').forEach(x=>x.classList.remove('active'));
+          b.classList.add('active');
+          // pane switch
+          Object.values(panes).forEach(p=>p.classList.remove('active'));
+          panes[target]?.classList.add('active');
+        }, {passive:true});
+      });
+    }
+
+    function initTopButtons(){
+      document.getElementById('copySubUrl')?.addEventListener('click', async (e)=>{
+        addRipple(e);
+        const btn=e.currentTarget;
+        const full=/^https?:\/\//i.test(SUBSCRIPTION_URL)?SUBSCRIPTION_URL:(location.origin+SUBSCRIPTION_URL);
+        try{ await copyText(full); flash(btn,'کپی شد'); }catch(_){}
+      });
+      document.getElementById('copyAll')?.addEventListener('click',async (e)=>{
+        addRipple(e);
+        try{
+          const full=/^https?:\/\//i.test(SUBSCRIPTION_URL)?SUBSCRIPTION_URL:(location.origin+SUBSCRIPTION_URL);
+          const res=await fetch(full); const text=await res.text();
+          const content=decodeBase64Maybe(text).trim();
+          const onlyUris = content.split('\n').map(s=>s.trim()).filter(s=>/^(vmess|vless|trojan|ss):\/\//i.test(s)).join('\n');
+          await copyText(onlyUris||content);
+          flash(document.getElementById('copyAll'),'همه کپی شد');
+        }catch(_){}
+      });
+    }
+    function initRipples(){
+      document.querySelectorAll('.pressable').forEach(el=>{
+        el.addEventListener('click', addRipple, {passive:true});
+      });
+    }
+
+    function enhanceDetailsAnimation(){
+      // فقط چرخش آیکن با CSS انجام می‌شود؛
+      // این تابع برای بهبود دسترسی و افزودن فوکوس استایل است (اختیاری).
+      document.querySelectorAll('details summary').forEach(s=>{
+        s.setAttribute('role','button');
+        s.setAttribute('tabindex','0');
+        s.addEventListener('keydown', (ev)=>{
+          if(ev.key === 'Enter' || ev.key === ' '){
+            ev.preventDefault();
+            s.click();
+          }
+        });
+      });
+    }
+
+    document.addEventListener('DOMContentLoaded', async ()=>{
+      setupGauges(); setExpireJalali(); setResetText();
+      const items=await fetchConfigs(SUBSCRIPTION_URL); renderConfigs(items);
+      initTabs(); initTopButtons(); initRipples(); enhanceDetailsAnimation();
+    });
+  </script>
+</body>
+</html>
