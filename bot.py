@@ -46,6 +46,7 @@ from telegram.ext import (
 )
 
 import usage_sync
+import services
 
 # ---------- logging ----------
 logging.basicConfig(
@@ -283,6 +284,34 @@ def ensure_schema():
                 panel_id BIGINT NOT NULL,
                 UNIQUE KEY uq_agent_panel(agent_tg_id, panel_id),
                 FOREIGN KEY (panel_id) REFERENCES panels(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+
+        # services
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS services(
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                owner_id BIGINT NOT NULL,
+                name VARCHAR(128) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_owner_name(owner_id, name)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS service_panels(
+                service_id BIGINT NOT NULL,
+                panel_id BIGINT NOT NULL,
+                UNIQUE KEY uq_service_panel(service_id, panel_id),
+                FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+                FOREIGN KEY (panel_id) REFERENCES panels(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS service_users(
+                service_id BIGINT NOT NULL,
+                local_username VARCHAR(64) NOT NULL,
+                UNIQUE KEY uq_service_user(service_id, local_username),
+                FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
 
@@ -2296,6 +2325,19 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
         note += "\n⚠️ خطاها:\n" + "\n".join(f"• {e}" for e in added_errs[:10])
     await show_user_card(q, owner_id, username, notice=note)
 
+
+# ---------- services ----------
+async def add_service_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create a new service (admin only)."""
+    if not is_admin(update.effective_user.id):
+        return
+    name = " ".join(context.args or [])
+    if not name:
+        await update.message.reply_text("Usage: /addservice <name>")
+        return
+    sid = services.create_service(name, canonical_owner_id(update.effective_user.id))
+    await update.message.reply_text(f"Service created with id {sid}")
+
 # ---------- wiring ----------
 def build_app():
     load_dotenv()
@@ -2304,6 +2346,8 @@ def build_app():
         raise RuntimeError("BOT_TOKEN missing in .env")
     init_mysql_pool()
     ensure_schema()
+    services.set_pool(MYSQL_POOL)
+    services.set_helpers(disable_remote, list_mapped_links)
     app = Application.builder().token(tok).build()
 
     conv = ConversationHandler(
@@ -2350,6 +2394,7 @@ def build_app():
         allow_reentry=True,
     )
     app.add_handler(conv)
+    app.add_handler(CommandHandler("addservice", add_service_cmd))
     return app
 
 if __name__ == "__main__":
