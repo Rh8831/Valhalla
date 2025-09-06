@@ -285,6 +285,35 @@ def ensure_schema():
                 FOREIGN KEY (panel_id) REFERENCES panels(id) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
+        # services
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS services(
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                owner_id BIGINT NOT NULL,
+                name VARCHAR(128) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_owner_name(owner_id, name)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS service_panels(
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                service_id BIGINT NOT NULL,
+                panel_id BIGINT NOT NULL,
+                UNIQUE KEY uq_service_panel(service_id, panel_id),
+                FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+                FOREIGN KEY (panel_id) REFERENCES panels(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS agent_services(
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                agent_tg_id BIGINT NOT NULL,
+                service_id BIGINT NOT NULL,
+                UNIQUE KEY uq_agent_service(agent_tg_id, service_id),
+                FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
 
 # ---------- helpers ----------
 UNIT = 1024
@@ -355,13 +384,96 @@ def list_my_panels_admin(admin_tg_id: int):
         return cur.fetchall()
 
 def list_panels_for_agent(agent_tg_id: int):
+    """Return panels accessible to an agent.
+
+    Panels may be assigned directly to the agent or indirectly via services
+    which group multiple panels together.
+    """
     with with_mysql_cursor() as cur:
-        cur.execute("""
+        panels = []
+        cur.execute(
+            """
             SELECT p.* FROM agent_panels ap
             JOIN panels p ON p.id = ap.panel_id
             WHERE ap.agent_tg_id=%s
-            ORDER BY p.created_at DESC
-        """, (agent_tg_id,))
+            """,
+            (agent_tg_id,),
+        )
+        panels.extend(cur.fetchall())
+        cur.execute(
+            """
+            SELECT p.* FROM agent_services ags
+            JOIN service_panels sp ON sp.service_id = ags.service_id
+            JOIN panels p ON p.id = sp.panel_id
+            WHERE ags.agent_tg_id=%s
+            """,
+            (agent_tg_id,),
+        )
+        panels.extend(cur.fetchall())
+    uniq = {}
+    for p in panels:
+        uniq[p["id"]] = p
+    return list(uniq.values())
+
+# ----- service helpers -----
+
+def create_service(owner_id: int, name: str) -> int:
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            "INSERT INTO services(owner_id, name) VALUES(%s,%s)",
+            (canonical_owner_id(owner_id), name),
+        )
+        return cur.lastrowid
+
+def list_services(owner_id: int):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            f"SELECT * FROM services WHERE owner_id IN ({placeholders}) ORDER BY created_at DESC",
+            tuple(ids),
+        )
+        return cur.fetchall()
+
+def assign_panel_to_service(service_id: int, panel_id: int):
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            "INSERT IGNORE INTO service_panels(service_id, panel_id) VALUES(%s,%s)",
+            (service_id, panel_id),
+        )
+
+def remove_panel_from_service(service_id: int, panel_id: int):
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            "DELETE FROM service_panels WHERE service_id=%s AND panel_id=%s",
+            (service_id, panel_id),
+        )
+
+def assign_service_to_agent(agent_tg_id: int, service_id: int):
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            "INSERT IGNORE INTO agent_services(agent_tg_id, service_id) VALUES(%s,%s)",
+            (agent_tg_id, service_id),
+        )
+
+def unassign_service_from_agent(agent_tg_id: int, service_id: int):
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            "DELETE FROM agent_services WHERE agent_tg_id=%s AND service_id=%s",
+            (agent_tg_id, service_id),
+        )
+
+def list_services_for_agent(agent_tg_id: int):
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            """
+            SELECT s.* FROM agent_services ags
+            JOIN services s ON s.id = ags.service_id
+            WHERE ags.agent_tg_id=%s
+            ORDER BY s.created_at DESC
+            """,
+            (agent_tg_id,),
+        )
         return cur.fetchall()
 
 def upsert_app_user(tg_id: int, u: str) -> str:
