@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
+from datetime import datetime, timezone
 
 import requests
 
@@ -123,6 +124,53 @@ def remove_remote_user(panel_url: str, token: str, username: str) -> Tuple[bool,
         r = requests.delete(
             urljoin(panel_url.rstrip('/') + '/', f"/api/users/{username}"),
             headers=get_headers(token),
+            timeout=20,
+        )
+        if r.status_code == 200:
+            return True, None
+        return False, f"{r.status_code} {r.text[:200]}"
+    except Exception as e:  # pragma: no cover - network errors
+        return False, str(e)[:200]
+
+
+def reset_remote_user_usage(panel_url: str, token: str, username: str) -> Tuple[bool, Optional[str]]:
+    """Reset traffic statistics for *username* on the panel."""
+    try:
+        r = requests.post(
+            urljoin(panel_url.rstrip('/') + '/', f"/api/users/{username}/reset"),
+            headers=get_headers(token),
+            timeout=20,
+        )
+        if r.status_code == 200:
+            return True, None
+        return False, f"{r.status_code} {r.text[:200]}"
+    except Exception as e:  # pragma: no cover - network errors
+        return False, str(e)[:200]
+
+
+def update_remote_user(
+    panel_url: str,
+    token: str,
+    username: str,
+    data_limit: Optional[int] = None,
+    expire: Optional[int] = None,
+) -> Tuple[bool, Optional[str]]:
+    """Update quota or expiry for *username* on the panel."""
+    payload: Dict[str, object] = {"username": username}
+    if data_limit is not None:
+        payload["data_limit"] = int(data_limit)
+        payload["data_limit_reset_strategy"] = "no_reset"
+    if expire is not None:
+        dt = datetime.fromtimestamp(int(expire), tz=timezone.utc)
+        payload["expire_strategy"] = "fixed_date"
+        payload["expire_date"] = dt.isoformat().replace("+00:00", "Z")
+    if len(payload) == 1:
+        return True, None
+    try:
+        r = requests.put(
+            urljoin(panel_url.rstrip('/') + '/', f"/api/users/{username}"),
+            json=payload,
+            headers={**get_headers(token), "Content-Type": "application/json"},
             timeout=20,
         )
         if r.status_code == 200:
