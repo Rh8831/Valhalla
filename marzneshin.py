@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
+from datetime import datetime, timezone
 
 import requests
 
@@ -155,13 +156,15 @@ def update_remote_user(
     expire: Optional[int] = None,
 ) -> Tuple[bool, Optional[str]]:
     """Update quota or expiry for *username* on the panel."""
-    payload: Dict[str, int] = {}
+    payload: Dict[str, object] = {"username": username}
     if data_limit is not None:
         payload["data_limit"] = int(data_limit)
         payload["data_limit_reset_strategy"] = "no_reset"
     if expire is not None:
-        payload["expire"] = int(expire)
-    if not payload:
+        dt = datetime.fromtimestamp(int(expire), tz=timezone.utc)
+        payload["expire_strategy"] = "fixed_date"
+        payload["expire_date"] = dt.isoformat().replace("+00:00", "Z")
+    if len(payload) == 1:
         return True, None
     try:
         r = requests.put(

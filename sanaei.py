@@ -281,7 +281,7 @@ def update_remote_user(
         if data_limit is not None:
             client['totalGB'] = int(data_limit)
         if expire is not None:
-            client['expiryTime'] = int(expire)
+            client['expiryTime'] = int(expire) * 1000
         payload = {
             'id': inbound.get('id'),
             'settings': json.dumps({'clients': [client]}, separators=(',', ':')),
