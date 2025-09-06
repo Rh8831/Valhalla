@@ -8,10 +8,11 @@ Admin:
 - Remove panel (disables all mapped users on that panel first)
 - Manage agents: add/edit (name), set agent quota (bytes), renew expiry by **days**, activate/deactivate
 - Assign panels to agents (checkbox)
+- Manage services (group panels under a service)
 Agent:
-- New local user (with panel multi-select limited to assigned panels)
+- New local user (assign a service)
 - Search/list users
-- Edit user (limit/reset/renew + panel selection limited to assigned)
+- Edit user (limit/reset/renew + change service)
 
 Shared:
 - Unified subscription link per user
@@ -124,7 +125,6 @@ def canonical_owner_id(owner_id: int) -> int:
     ASK_SEARCH_USER, ASK_PANEL_TEMPLATE,
     ASK_EDIT_LIMIT, ASK_RENEW_DAYS,
     ASK_EDIT_PANEL_NAME, ASK_EDIT_PANEL_USER, ASK_EDIT_PANEL_PASS,
-    ASK_SELECT_PANELS,
     ASK_SELECT_SERVICE,
     ASK_PANEL_SUB_URL,
 
@@ -137,7 +137,7 @@ def canonical_owner_id(owner_id: int) -> int:
 
     # service mgmt
     ASK_SERVICE_NAME, ASK_EDIT_SERVICE_NAME, ASK_ASSIGN_SERVICE_PANELS,
-) = range(29)
+) = range(28)
 
 # ---------- MySQL ----------
 MYSQL_POOL = None
@@ -448,21 +448,8 @@ def set_local_user_service(owner_id: int, username: str, service_id: int | None)
             "UPDATE local_users SET service_id=%s WHERE owner_id=%s AND username=%s",
             (service_id, owner_id, username),
         )
-    replace_user_panels_with_service(owner_id, username, service_id)
-
-def replace_user_panels_with_service(owner_id: int, username: str, service_id: int | None):
-    """Ensure local_user_panel_links match service panels."""
     pids = list_service_panel_ids(service_id) if service_id else set()
-    with with_mysql_cursor(dict_=False) as cur:
-        cur.execute(
-            "DELETE FROM local_user_panel_links WHERE owner_id=%s AND local_username=%s",
-            (owner_id, username),
-        )
-        if pids:
-            cur.executemany(
-                "INSERT INTO local_user_panel_links(owner_id,local_username,panel_id,remote_username) VALUES(%s,%s,%s,%s)",
-                [(owner_id, username, int(pid), username) for pid in pids],
-            )
+    sync_user_panels(owner_id, username, pids)
 
 def propagate_service_panels(service_id: int):
     """After service panels change, update agents/users accordingly."""
@@ -470,7 +457,7 @@ def propagate_service_panels(service_id: int):
     for ag_id in list_agents_by_service(service_id):
         set_agent_panels(ag_id, pids)
     for row in list_local_users_by_service(service_id):
-        replace_user_panels_with_service(row["owner_id"], row["username"], service_id)
+        sync_user_panels(row["owner_id"], row["username"], pids)
 
 def upsert_app_user(tg_id: int, u: str) -> str:
     owner_ids = expand_owner_ids(tg_id)
@@ -927,34 +914,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
 
-def _panel_select_kb(panels, selected: set, mode: str):
+def _panel_select_kb(panels, selected: set):
     rows = []
     for p in panels:
         pid = int(p["id"])
         mark = "✅" if pid in selected else "⬜"
         title = f"{mark} {p['name']} ({p.get('panel_type', 'marzneshin')})"
-        if mode == "assign":
-            cb = f"ap:toggle:{pid}"
-        else:
-            cb = f"selpanel:toggle:{pid}"
-        rows.append([InlineKeyboardButton(title[:64], callback_data=cb)])
-
-    if mode == "assign":
-        prefix = "ap"
-        apply_cb = "ap:apply"
-        cancel_cb = "ap:cancel"
-    else:
-        prefix = "selpanel"
-        apply_cb = f"selpanel:apply:{mode}"
-        cancel_cb = "selpanel:cancel"
+        rows.append([InlineKeyboardButton(title[:64], callback_data=f"ap:toggle:{pid}")])
 
     rows.append([
-        InlineKeyboardButton("☑️ All", callback_data=f"{prefix}:all"),
-        InlineKeyboardButton("🔲 None", callback_data=f"{prefix}:none"),
+        InlineKeyboardButton("☑️ All", callback_data="ap:all"),
+        InlineKeyboardButton("🔲 None", callback_data="ap:none"),
     ])
     rows.append([
-        InlineKeyboardButton("✅ Apply", callback_data=apply_cb),
-        InlineKeyboardButton("❌ Cancel", callback_data=cancel_cb),
+        InlineKeyboardButton("✅ Apply", callback_data="ap:apply"),
+        InlineKeyboardButton("❌ Cancel", callback_data="ap:cancel"),
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -974,48 +948,6 @@ def _service_panel_select_kb(panels, selected: set):
         InlineKeyboardButton("❌ Cancel", callback_data="sp:cancel"),
     ])
     return InlineKeyboardMarkup(rows)
-
-async def show_panel_select(update_or_q, context, owner_id: int, mode: str, username: str = None):
-    panels = list_panels_for_agent(owner_id) if not is_admin(owner_id) else list_my_panels_admin(owner_id)
-    if not panels:
-        msg = "❌ هیچ پنلی ثبت نشده."
-        if hasattr(update_or_q, "edit_message_text"):
-            await update_or_q.edit_message_text(msg)
-        else:
-            await update_or_q.message.reply_text(msg)
-        return ConversationHandler.END
-
-    if mode == "create":
-        panels = [
-            p for p in panels
-            if not ((p.get("panel_type") in ("marzneshin", "sanaei")) and not p.get("template_username"))
-        ]
-        if not panels:
-            txt = "⚠️ هیچ پنلی template/inbound ندارد. از 🛠️ Manage Panels تنظیم کن."
-            if hasattr(update_or_q, "edit_message_text"):
-                await update_or_q.edit_message_text(txt)
-            else:
-                await update_or_q.message.reply_text(txt)
-            return ConversationHandler.END
-        selected = {int(p["id"]) for p in panels}
-    else:
-        linked = list_linked_panel_ids(owner_id, username)
-        selected = set(linked)
-
-    context.user_data["panel_select_mode"] = mode
-    context.user_data["panel_select_username"] = username
-    context.user_data["panel_select_list"] = panels
-    context.user_data["panel_selected"] = selected
-
-    text = ("پنل‌های فعال برای ساخت یوزر جدید را انتخاب کن:"
-            if mode == "create"
-            else f"پنل‌های فعال برای <b>{username}</b> را انتخاب/غیرفعال کن:")
-    kb = _panel_select_kb(panels, selected, mode)
-    if hasattr(update_or_q, "edit_message_text"):
-        await update_or_q.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
-    else:
-        await update_or_q.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
-    return ASK_SELECT_PANELS
 
 async def show_service_panel_select(q, context, service_id: int):
     uid = q.from_user.id
@@ -1263,13 +1195,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "act_renew":
         await q.edit_message_text("چند روز اضافه شود؟ (مثلا 30)") ; return ASK_RENEW_DAYS
 
-    if data == "act_user_panels":
-        uname = context.user_data.get("manage_username")
-        if not uname:
-            await q.edit_message_text("یوزر انتخاب نشده.")
-            return ConversationHandler.END
-        return await show_panel_select(q, context, uid, mode="edit", username=uname)
-
     if data == "act_assign_service":
         uname = context.user_data.get("manage_username")
         rows = list_services()
@@ -1410,7 +1335,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif cmd == "cancel":
             return await show_agent_card(q, context, a)
         context.user_data["ap_selected"] = selected
-        kb = _panel_select_kb(panels, selected, mode="assign")
+        kb = _panel_select_kb(panels, selected)
         await q.edit_message_text("پنل‌های این نماینده:", reply_markup=kb)
         return ConversationHandler.END
 
@@ -1443,7 +1368,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start(update, context)
         return ConversationHandler.END
 
-    # ---- panel multi-select handlers ----
+    # ---- service selection during user creation ----
     if data.startswith("selservice:"):
         cmd = data.split(":",1)[1]
         if cmd == "cancel":
@@ -1458,47 +1383,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await finalize_create_on_selected(q, context, uid, selected_ids)
         set_local_user_service(uid, context.user_data.get("new_username"), sid)
         return ConversationHandler.END
-
-    if data.startswith("selpanel:"):
-        mode = context.user_data.get("panel_select_mode")
-        panels = context.user_data.get("panel_select_list") or []
-        selected = context.user_data.get("panel_selected") or set()
-
-        if data == "selpanel:all":
-            selected = {int(p["id"]) for p in panels}
-        elif data == "selpanel:none":
-            selected = set()
-        elif data.startswith("selpanel:toggle:"):
-            pid = int(data.split(":", 2)[2])
-            if pid in selected: selected.remove(pid)
-            else: selected.add(pid)
-        elif data.startswith("selpanel:apply:"):
-            which = data.split(":", 2)[2]
-            if which != mode:
-                pass
-            if mode == "create":
-                await q.edit_message_text("⏳ در حال ساخت روی پنل‌های انتخابی ...")
-                await finalize_create_on_selected(q, context, uid, selected)
-            else:
-                uname = context.user_data.get("panel_select_username")
-                await q.edit_message_text("⏳ در حال اعمال تغییرات پنل‌های کاربر ...")
-                await apply_edit_user_panels(q, uid, uname, selected)
-            return ConversationHandler.END
-        elif data == "selpanel:cancel":
-            if mode == "create":
-                await q.edit_message_text("لغو شد.")
-                return ConversationHandler.END
-            else:
-                uname = context.user_data.get("panel_select_username")
-                return await show_user_card(q, uid, uname)
-
-        context.user_data["panel_selected"] = selected
-        await q.edit_message_text(
-            ("پنل‌های فعال برای ساخت یوزر جدید را انتخاب کن:" if mode == "create"
-             else f"پنل‌های فعال را برای <b>{context.user_data.get('panel_select_username')}</b> انتخاب/غیرفعال کن:"),
-            reply_markup=_panel_select_kb(panels, selected, mode), parse_mode="HTML"
-        )
-        return ASK_SELECT_PANELS
 
     # ---------- panel cfg selector actions ----------
     if data.startswith("pcfg:"):
@@ -1825,7 +1709,6 @@ async def show_user_card(q, owner_id: int, uname: str, notice: str = None):
         [InlineKeyboardButton("🧹 Reset Used", callback_data="act_reset_used")],
         [InlineKeyboardButton("🔁 Renew (add days)", callback_data="act_renew")],
         [InlineKeyboardButton("🧰 Assign Service", callback_data="act_assign_service")],
-        [InlineKeyboardButton("🧩 Panels", callback_data="act_user_panels")],
         [InlineKeyboardButton("🗑️ Delete User", callback_data="act_del_user")],
         [InlineKeyboardButton("⬅️ Back", callback_data="list_users:0")],
     ]
@@ -1875,7 +1758,7 @@ async def show_assign_panels(q, context: ContextTypes.DEFAULT_TYPE, agent_tg_id:
     selected = set(list_agent_panel_ids(agent_tg_id))
     context.user_data["agent_tg_id"] = agent_tg_id
     context.user_data["ap_selected"] = selected
-    kb = _panel_select_kb(panels, selected, mode="assign")
+    kb = _panel_select_kb(panels, selected)
     await q.edit_message_text("پنل‌های این نماینده:", reply_markup=kb)
     return ConversationHandler.END
 
@@ -2431,7 +2314,7 @@ async def finalize_create_on_selected(q, context, owner_id: int, selected_ids: s
         txt += "\n⚠️ خطاها:\n" + "\n".join(f"• {e}" for e in failed[:8])
     await q.edit_message_text(txt)
 
-async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: set):
+def sync_user_panels(owner_id: int, username: str, selected_ids: set):
     links_map = map_linked_remote_usernames(owner_id, username)
     current = set(links_map.keys())
     to_add = selected_ids - current
@@ -2615,9 +2498,9 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
                 api = get_api(p.get("panel_type"))
                 remotes = remote.split(",") if p.get("panel_type") == "sanaei" else [remote]
                 for rn in remotes:
-                    ok, err = api.disable_remote_user(p["panel_url"], p["access_token"], rn)
+                    ok, err = api.remove_remote_user(p["panel_url"], p["access_token"], rn)
                     if not ok:
-                        added_errs.append(f"disable on {p['panel_url']}: {err or 'unknown error'}")
+                        added_errs.append(f"remove on {p['panel_url']}: {err or 'unknown error'}")
 
     for pid in selected_ids:
         p = panels_map.get(int(pid))
@@ -2638,10 +2521,16 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
             save_link(owner_id, username, int(pid), remote)
             links_map[int(pid)] = remote
 
-    note = f"✅ اعمال شد. اضافه/ایجاد: {added_ok} | حذف مپ/دیسیبل: {removed} | فعال‌شده‌ها: {enabled_ok}"
+    log.info(
+        "sync_user_panels %s/%s -> add:%d remove:%d enable:%d",
+        owner_id,
+        username,
+        added_ok,
+        removed,
+        enabled_ok,
+    )
     if added_errs:
-        note += "\n⚠️ خطاها:\n" + "\n".join(f"• {e}" for e in added_errs[:10])
-    await show_user_card(q, owner_id, username, notice=note)
+        log.warning("sync_user_panels errors: %s", "; ".join(added_errs[:10]))
 
 # ---------- wiring ----------
 def build_app():
@@ -2689,8 +2578,7 @@ def build_app():
             ASK_LIMIT_GB:     [MessageHandler(filters.TEXT & ~filters.COMMAND, got_limit)],
             ASK_DURATION:     [MessageHandler(filters.TEXT & ~filters.COMMAND, got_duration)],
 
-            # panel multi-select (create/edit)
-            ASK_SELECT_PANELS: [CallbackQueryHandler(on_button)],
+            # service selection for new user
             ASK_SELECT_SERVICE: [CallbackQueryHandler(on_button)],
 
             # search/manage
