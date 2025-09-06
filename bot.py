@@ -46,6 +46,7 @@ from telegram.ext import (
 )
 
 import usage_sync
+import service_manager
 
 # ---------- logging ----------
 logging.basicConfig(
@@ -133,7 +134,12 @@ def canonical_owner_id(owner_id: int) -> int:
     ASK_AGENT_MAX_USERS, ASK_AGENT_MAX_USER_GB,
     ASK_ASSIGN_AGENT_PANELS,
     ASK_PANEL_REMOVE_CONFIRM,
-) = range(25)
+
+    # service mgmt
+    ASK_SERVICE_NAME, ASK_SERVICE_PANEL,
+    ASK_EDIT_SERVICE_NAME, ASK_SWITCH_SERVICE_PANEL,
+    ASK_SERVICE_REMOVE_CONFIRM,
+) = range(30)
 
 # ---------- MySQL ----------
 MYSQL_POOL = None
@@ -392,6 +398,63 @@ def list_panels_for_agent(agent_tg_id: int):
             (agent_tg_id,),
         )
         return cur.fetchall()
+
+def list_services(owner_id: int):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT s.*, p.name AS panel_name
+            FROM services s
+            JOIN panels p ON p.id = s.panel_id
+            WHERE s.telegram_user_id IN ({placeholders})
+            ORDER BY s.created_at DESC
+            """,
+            tuple(ids),
+        )
+        return cur.fetchall()
+
+def get_service(owner_id: int, service_id: int):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT s.*, p.name AS panel_name
+            FROM services s
+            JOIN panels p ON p.id = s.panel_id
+            WHERE s.id=%s AND s.telegram_user_id IN ({placeholders})
+            """,
+            tuple([service_id] + ids),
+        )
+        return cur.fetchone()
+
+def add_service(owner_id: int, name: str, panel_id: int) -> int:
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            "INSERT INTO services(telegram_user_id,name,panel_id) VALUES(%s,%s,%s)",
+            (canonical_owner_id(owner_id), name, panel_id),
+        )
+        return cur.lastrowid
+
+def rename_service(owner_id: int, service_id: int, name: str):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            f"UPDATE services SET name=%s WHERE id=%s AND telegram_user_id IN ({placeholders})",
+            tuple([name, service_id] + ids),
+        )
+
+def delete_service(owner_id: int, service_id: int):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            f"DELETE FROM services WHERE id=%s AND telegram_user_id IN ({placeholders})",
+            tuple([service_id] + ids),
+        )
 
 def upsert_app_user(tg_id: int, u: str) -> str:
     owner_ids = expand_owner_ids(tg_id)
@@ -935,6 +998,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = [
             [InlineKeyboardButton("➕ Add Panel", callback_data="add_panel")],
             [InlineKeyboardButton("🛠️ Manage Panels", callback_data="manage_panels")],
+            [InlineKeyboardButton("➕ Add Service", callback_data="add_service")],
+            [InlineKeyboardButton("📦 Manage Services", callback_data="manage_services")],
             [InlineKeyboardButton("👑 Manage Agents", callback_data="manage_agents")],
             [InlineKeyboardButton("⬅️ Back", callback_data="back_home")],
         ]
@@ -961,6 +1026,28 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     callback_data=f"panel_sel:{r['id']}")] for r in rows]
         kb.append([InlineKeyboardButton("⬅️ Back", callback_data="back_home")])
         await q.edit_message_text("یک پنل را انتخاب کن:", reply_markup=InlineKeyboardMarkup(kb))
+        return ConversationHandler.END
+
+    if data == "add_service":
+        if not is_admin(uid):
+            await q.edit_message_text("فقط ادمین می‌تواند سرویس اضافه کند.")
+            return ConversationHandler.END
+        await q.edit_message_text("نام سرویس را بفرست:")
+        return ASK_SERVICE_NAME
+
+    if data == "manage_services":
+        if not is_admin(uid):
+            await q.edit_message_text("دسترسی ندارید.")
+            return ConversationHandler.END
+        rows = list_services(uid)
+        kb = [[InlineKeyboardButton(f"{r['name']} ({r['panel_name']})"[:64],
+                                    callback_data=f"service_sel:{r['id']}")] for r in rows]
+        kb.append([InlineKeyboardButton("➕ Add Service", callback_data="add_service")])
+        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="back_home")])
+        if not rows:
+            await q.edit_message_text("هیچ سرویسی ثبت نشده.", reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await q.edit_message_text("یک سرویس را انتخاب کن:", reply_markup=InlineKeyboardMarkup(kb))
         return ConversationHandler.END
 
     if data.startswith("panel_sel:"):
@@ -1038,6 +1125,69 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pid = context.user_data.get("edit_panel_id")
         delete_panel_and_cleanup(uid, pid)
         await q.edit_message_text("✅ پنل حذف شد و همهٔ کانفیگ‌های مرتبط دیزیبل شدند.")
+        return ConversationHandler.END
+
+    if data.startswith("service_sel:"):
+        if not is_admin(uid):
+            await q.edit_message_text("دسترسی ندارید.")
+            return ConversationHandler.END
+        sid = int(data.split(":", 1)[1])
+        context.user_data["edit_service_id"] = sid
+        return await show_service_card(q, context, uid, sid)
+
+    if data.startswith("svc_newpanel_sel:"):
+        if not is_admin(uid): return ConversationHandler.END
+        pid = int(data.split(":",1)[1])
+        name = context.user_data.pop("new_service_name", None)
+        if not name:
+            await q.edit_message_text("❌ نام سرویس مشخص نیست.")
+            return ConversationHandler.END
+        try:
+            sid = add_service(uid, name, pid)
+        except Exception as e:
+            await q.edit_message_text(f"❌ خطای DB: {e}")
+            return ConversationHandler.END
+        context.user_data["edit_service_id"] = sid
+        return await show_service_card(q, context, uid, sid, notice="✅ سرویس اضافه شد.")
+
+    if data == "svc_change_panel":
+        if not is_admin(uid): return ConversationHandler.END
+        sid = context.user_data.get("edit_service_id")
+        panels = list_my_panels_admin(uid)
+        kb = [[InlineKeyboardButton(p['name'][:64], callback_data=f"svc_switchpanel_sel:{p['id']}")] for p in panels]
+        kb.append([InlineKeyboardButton("⬅️ Back", callback_data=f"service_sel:{sid}")])
+        await q.edit_message_text("پنل جدید را انتخاب کن:", reply_markup=InlineKeyboardMarkup(kb))
+        return ASK_SWITCH_SERVICE_PANEL
+
+    if data.startswith("svc_switchpanel_sel:"):
+        if not is_admin(uid): return ConversationHandler.END
+        sid = context.user_data.get("edit_service_id")
+        pid = int(data.split(":",1)[1])
+        ok, msg = service_manager.switch_service_panel(sid, pid)
+        if not ok:
+            await q.edit_message_text(f"❌ {msg}")
+            return ConversationHandler.END
+        return await show_service_card(q, context, uid, sid, notice="✅ پنل تغییر کرد.")
+
+    if data == "svc_rename":
+        if not is_admin(uid): return ConversationHandler.END
+        await q.edit_message_text("اسم جدید سرویس را بفرست:") ; return ASK_EDIT_SERVICE_NAME
+
+    if data == "svc_remove":
+        if not is_admin(uid): return ConversationHandler.END
+        sid = context.user_data.get("edit_service_id")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ بله، حذف کن", callback_data="svc_remove_yes")],
+            [InlineKeyboardButton("⬅️ انصراف", callback_data=f"service_sel:{sid}")],
+        ])
+        await q.edit_message_text("سرویس حذف شود؟", reply_markup=kb)
+        return ASK_SERVICE_REMOVE_CONFIRM
+
+    if data == "svc_remove_yes":
+        if not is_admin(uid): return ConversationHandler.END
+        sid = context.user_data.get("edit_service_id")
+        delete_service(uid, sid)
+        await q.edit_message_text("✅ سرویس حذف شد.")
         return ConversationHandler.END
 
     if data == "new_user":
@@ -1501,6 +1651,29 @@ async def show_panel_card(q, context: ContextTypes.DEFAULT_TYPE, owner_id: int, 
     await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     return ConversationHandler.END
 
+async def show_service_card(q, context: ContextTypes.DEFAULT_TYPE, owner_id: int, service_id: int, notice: str = None):
+    s = get_service(owner_id, service_id)
+    if not s:
+        await q.edit_message_text("سرویس پیدا نشد.")
+        return ConversationHandler.END
+    lines = []
+    if notice:
+        lines.append(notice)
+    lines += [
+        f"🛰️ <b>{s['name']}</b>",
+        f"🧩 Panel: <b>{s['panel_name']}</b>",
+        "",
+        "چه کاری انجام بدهم؟",
+    ]
+    kb = [
+        [InlineKeyboardButton("🔁 Change Panel", callback_data="svc_change_panel")],
+        [InlineKeyboardButton("✏️ Rename Service", callback_data="svc_rename")],
+        [InlineKeyboardButton("🗑️ Remove Service", callback_data="svc_remove")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="manage_services")],
+    ]
+    await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+    return ConversationHandler.END
+
 async def show_user_card(q, owner_id: int, uname: str, notice: str = None):
     row = get_local_user(owner_id, uname)
     if not row:
@@ -1790,6 +1963,42 @@ async def got_panel_sub_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async def edit_message_text(self, *args, **kwargs):
                 await update.message.reply_text(*args, **kwargs)
         return await show_panel_card(FakeCQ(), context, update.effective_user.id, pid)
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطا: {e}")
+        return ConversationHandler.END
+
+# ---------- service mgmt ----------
+async def got_service_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    name = (update.message.text or "").strip()
+    if not name:
+        await update.message.reply_text("❌ نام معتبر بفرست:")
+        return ASK_SERVICE_NAME
+    panels = list_my_panels_admin(update.effective_user.id)
+    if not panels:
+        await update.message.reply_text("هیچ پنلی ثبت نشده.")
+        return ConversationHandler.END
+    context.user_data["new_service_name"] = name
+    kb = [[InlineKeyboardButton(p["name"][:64], callback_data=f"svc_newpanel_sel:{p['id']}")] for p in panels]
+    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="back_home")])
+    await update.message.reply_text("پنل این سرویس را انتخاب کن:", reply_markup=InlineKeyboardMarkup(kb))
+    return ASK_SERVICE_PANEL
+
+async def got_edit_service_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    sid = context.user_data.get("edit_service_id")
+    new = (update.message.text or "").strip()
+    if not sid or not new:
+        await update.message.reply_text("❌ ورودی نامعتبر.")
+        return ConversationHandler.END
+    try:
+        rename_service(update.effective_user.id, sid, new)
+        class FakeCQ:
+            async def edit_message_text(self, *args, **kwargs):
+                await update.message.reply_text(*args, **kwargs)
+        return await show_service_card(FakeCQ(), context, update.effective_user.id, sid, notice="✅ نام سرویس تغییر کرد.")
     except Exception as e:
         await update.message.reply_text(f"❌ خطا: {e}")
         return ConversationHandler.END
@@ -2352,6 +2561,13 @@ def build_app():
             ASK_EDIT_PANEL_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_edit_panel_pass)],
             ASK_PANEL_SUB_URL:  [MessageHandler(filters.TEXT & ~filters.COMMAND, got_panel_sub_url)],
             ASK_PANEL_REMOVE_CONFIRM: [CallbackQueryHandler(on_button)],
+
+            # service mgmt (admin)
+            ASK_SERVICE_NAME:         [MessageHandler(filters.TEXT & ~filters.COMMAND, got_service_name)],
+            ASK_EDIT_SERVICE_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, got_edit_service_name)],
+            ASK_SERVICE_PANEL:        [CallbackQueryHandler(on_button)],
+            ASK_SWITCH_SERVICE_PANEL: [CallbackQueryHandler(on_button)],
+            ASK_SERVICE_REMOVE_CONFIRM: [CallbackQueryHandler(on_button)],
 
             # agent mgmt (admin)
             ASK_AGENT_NAME:        [MessageHandler(filters.TEXT & ~filters.COMMAND, got_agent_name)],
