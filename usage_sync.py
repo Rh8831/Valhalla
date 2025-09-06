@@ -53,7 +53,10 @@ def init_if_needed():
     """Initialize DB pool if not already initialized."""
     global POOL
     if POOL is None:
-        load_dotenv()
+        load_dotenv(
+            dotenv_path=os.path.join(os.path.dirname(__file__), ".env"),
+            override=True,
+        )
         init_db()
 
 class CurCtx:
