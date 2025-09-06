@@ -285,6 +285,34 @@ def ensure_schema():
                 FOREIGN KEY (panel_id) REFERENCES panels(id) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
+        cur.execute("""\
+            CREATE TABLE IF NOT EXISTS services(
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                owner_id BIGINT NOT NULL,
+                name VARCHAR(128) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_service(owner_id, name)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        cur.execute("""\
+            CREATE TABLE IF NOT EXISTS service_panels(
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                service_id BIGINT NOT NULL,
+                panel_id BIGINT NOT NULL,
+                UNIQUE KEY uq_service_panel(service_id, panel_id),
+                FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+                FOREIGN KEY (panel_id) REFERENCES panels(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        cur.execute("""\
+            CREATE TABLE IF NOT EXISTS agent_services(
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                agent_tg_id BIGINT NOT NULL,
+                service_id BIGINT NOT NULL,
+                UNIQUE KEY uq_agent_service(agent_tg_id, service_id),
+                FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
 
 # ---------- helpers ----------
 UNIT = 1024
@@ -779,6 +807,73 @@ def set_agent_panels(agent_tg_id: int, panel_ids: set[int]):
         if panel_ids:
             cur.executemany("INSERT INTO agent_panels(agent_tg_id,panel_id) VALUES(%s,%s)",
                             [(agent_tg_id, int(pid)) for pid in panel_ids])
+
+def create_service(owner_id: int, name: str) -> int:
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            "INSERT INTO services(owner_id,name) VALUES(%s,%s)",
+            (canonical_owner_id(owner_id), name),
+        )
+        return cur.lastrowid
+
+def list_services(owner_id: int):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            f"SELECT * FROM services WHERE owner_id IN ({placeholders}) ORDER BY created_at DESC",
+            tuple(ids),
+        )
+        return cur.fetchall()
+
+def list_service_panel_ids(service_id: int):
+    with with_mysql_cursor() as cur:
+        cur.execute("SELECT panel_id FROM service_panels WHERE service_id=%s", (service_id,))
+        return {int(r['panel_id']) for r in cur.fetchall()}
+
+def set_service_panels(service_id: int, panel_ids: set[int]):
+    existing = list_service_panel_ids(service_id)
+    to_add = panel_ids - existing
+    to_remove = existing - panel_ids
+    with with_mysql_cursor() as cur:
+        cur.execute("DELETE FROM service_panels WHERE service_id=%s", (service_id,))
+        if panel_ids:
+            cur.executemany(
+                "INSERT INTO service_panels(service_id,panel_id) VALUES(%s,%s)",
+                [(service_id, int(pid)) for pid in panel_ids],
+            )
+    for pid in to_add:
+        link_all_users_to_panel(service_id, pid)
+    for pid in to_remove:
+        unlink_panel_from_service(service_id, pid)
+
+def list_agent_service_ids(agent_tg_id: int):
+    with with_mysql_cursor() as cur:
+        cur.execute("SELECT service_id FROM agent_services WHERE agent_tg_id=%s", (agent_tg_id,))
+        return {int(r['service_id']) for r in cur.fetchall()}
+
+def set_agent_services(agent_tg_id: int, service_ids: set[int]):
+    with with_mysql_cursor() as cur:
+        cur.execute("DELETE FROM agent_services WHERE agent_tg_id=%s", (agent_tg_id,))
+        if service_ids:
+            cur.executemany(
+                "INSERT INTO agent_services(agent_tg_id,service_id) VALUES(%s,%s)",
+                [(agent_tg_id, int(sid)) for sid in service_ids],
+            )
+
+def link_all_users_to_panel(service_id: int, panel_id: int):
+    """Sync all agent users of a service to a newly added panel.
+
+    TODO: Implement remote user creation, subscription updates and usage sync.
+    """
+    return
+
+def unlink_panel_from_service(service_id: int, panel_id: int):
+    """Disable or remove users from a panel removed from a service.
+
+    TODO: Implement remote disabling/removal and cleanup of local links.
+    """
+    return
 
 # ---------- UI ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
