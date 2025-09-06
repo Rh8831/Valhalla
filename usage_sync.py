@@ -283,12 +283,16 @@ def list_all_local_usernames(owner_id: int):
 def list_agent_assigned_panels(owner_id: int):
     """پنل‌هایی که به نماینده assign شده‌اند (agent_panels)."""
     with CurCtx() as cur:
-        cur.execute("""
+        cur.execute(
+            """
             SELECT p.id, p.panel_url, p.access_token, p.panel_type
             FROM agent_panels ap
-            JOIN panels p ON p.id = ap.panel_id
+            LEFT JOIN services s ON s.id = ap.service_id
+            JOIN panels p ON p.id = COALESCE(s.panel_id, ap.panel_id)
             WHERE ap.agent_tg_id=%s
-        """, (owner_id,))
+        """,
+            (owner_id,),
+        )
         return cur.fetchall()
 
 def mark_agent_disabled(owner_id: int):

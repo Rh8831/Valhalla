@@ -189,6 +189,17 @@ def ensure_schema():
         except MySQLError:
             pass
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS services(
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                telegram_user_id BIGINT NOT NULL,
+                name VARCHAR(128) NOT NULL,
+                panel_id BIGINT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_service_owner_name(telegram_user_id, name),
+                FOREIGN KEY (panel_id) REFERENCES panels(id) ON DELETE RESTRICT
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS app_users(
                 id BIGINT PRIMARY KEY AUTO_INCREMENT,
                 telegram_user_id BIGINT NOT NULL,
@@ -220,14 +231,21 @@ def ensure_schema():
                 owner_id BIGINT NOT NULL,
                 local_username VARCHAR(64) NOT NULL,
                 panel_id BIGINT NOT NULL,
+                service_id BIGINT NULL,
                 remote_username VARCHAR(128) NOT NULL,
                 last_used_traffic BIGINT NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 UNIQUE KEY uq_link(owner_id, local_username, panel_id),
-                FOREIGN KEY (panel_id) REFERENCES panels(id) ON DELETE CASCADE
+                FOREIGN KEY (panel_id) REFERENCES panels(id) ON DELETE CASCADE,
+                FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE SET NULL
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
+        try:
+            cur.execute("ALTER TABLE local_user_panel_links ADD COLUMN service_id BIGINT NULL AFTER panel_id")
+            cur.execute("ALTER TABLE local_user_panel_links ADD CONSTRAINT fk_lupl_service FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE SET NULL")
+        except MySQLError:
+            pass
         cur.execute("""
             CREATE TABLE IF NOT EXISTS panel_disabled_configs(
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -281,10 +299,17 @@ def ensure_schema():
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 agent_tg_id BIGINT NOT NULL,
                 panel_id BIGINT NOT NULL,
+                service_id BIGINT NULL,
                 UNIQUE KEY uq_agent_panel(agent_tg_id, panel_id),
-                FOREIGN KEY (panel_id) REFERENCES panels(id) ON DELETE CASCADE
+                FOREIGN KEY (panel_id) REFERENCES panels(id) ON DELETE CASCADE,
+                FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE SET NULL
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
+        try:
+            cur.execute("ALTER TABLE agent_panels ADD COLUMN service_id BIGINT NULL")
+            cur.execute("ALTER TABLE agent_panels ADD CONSTRAINT fk_agent_service FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE SET NULL")
+        except MySQLError:
+            pass
 
 # ---------- helpers ----------
 UNIT = 1024
@@ -356,12 +381,16 @@ def list_my_panels_admin(admin_tg_id: int):
 
 def list_panels_for_agent(agent_tg_id: int):
     with with_mysql_cursor() as cur:
-        cur.execute("""
+        cur.execute(
+            """
             SELECT p.* FROM agent_panels ap
-            JOIN panels p ON p.id = ap.panel_id
+            LEFT JOIN services s ON s.id = ap.service_id
+            JOIN panels p ON p.id = COALESCE(s.panel_id, ap.panel_id)
             WHERE ap.agent_tg_id=%s
             ORDER BY p.created_at DESC
-        """, (agent_tg_id,))
+        """,
+            (agent_tg_id,),
+        )
         return cur.fetchall()
 
 def upsert_app_user(tg_id: int, u: str) -> str:
