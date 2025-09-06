@@ -242,6 +242,63 @@ def remove_remote_user(panel_url: str, token: str, username: str) -> Tuple[bool,
         return False, str(e)[:200]
 
 
+def reset_remote_user_usage(panel_url: str, token: str, username: str) -> Tuple[bool, Optional[str]]:
+    """Reset traffic statistics for *username* on the panel."""
+    try:
+        inbounds, err = _list_inbounds(panel_url, token)
+        if err:
+            return False, err
+        inbound, client = _find_client(inbounds, username)
+        if not inbound or not client:
+            return False, 'not found'
+        url = urljoin(
+            panel_url.rstrip('/') + '/',
+            f"panel/api/inbounds/{inbound.get('id')}/resetClientTraffic/{username}",
+        )
+        r = requests.post(url, headers=get_headers(token), timeout=20)
+        if r.status_code == 200:
+            return True, None
+        return False, f"{r.status_code} {r.text[:200]}"
+    except Exception as e:  # pragma: no cover - network errors
+        return False, str(e)[:200]
+
+
+def update_remote_user(
+    panel_url: str,
+    token: str,
+    username: str,
+    data_limit: Optional[int] = None,
+    expire: Optional[int] = None,
+) -> Tuple[bool, Optional[str]]:
+    """Update quota or expiry for *username* on the panel."""
+    try:
+        inbounds, err = _list_inbounds(panel_url, token)
+        if err:
+            return False, err
+        inbound, client = _find_client(inbounds, username)
+        if not inbound or not client:
+            return False, 'not found'
+        if data_limit is not None:
+            client['totalGB'] = int(data_limit)
+        if expire is not None:
+            client['expiryTime'] = int(expire)
+        payload = {
+            'id': inbound.get('id'),
+            'settings': json.dumps({'clients': [client]}, separators=(',', ':')),
+        }
+        r = requests.post(
+            urljoin(panel_url.rstrip('/') + '/', f"panel/api/inbounds/updateClient/{client.get('id')}")
+            ,json=payload,
+            headers={**get_headers(token), 'Content-Type': 'application/json'},
+            timeout=20,
+        )
+        if r.status_code == 200:
+            return True, None
+        return False, f"{r.status_code} {r.text[:200]}"
+    except Exception as e:  # pragma: no cover - network errors
+        return False, str(e)[:200]
+
+
 def fetch_subscription_links(sub_url: str) -> List[str]:
     """Return links from a subscription URL if provided.
 
