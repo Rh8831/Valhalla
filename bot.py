@@ -46,6 +46,7 @@ from telegram.ext import (
 )
 
 import usage_sync
+import services
 
 # ---------- logging ----------
 logging.basicConfig(
@@ -126,6 +127,7 @@ def canonical_owner_id(owner_id: int) -> int:
     ASK_EDIT_PANEL_NAME, ASK_EDIT_PANEL_USER, ASK_EDIT_PANEL_PASS,
     ASK_SELECT_PANELS,
     ASK_PANEL_SUB_URL,
+    ASK_SERVICE_NAME,
 
     # agent mgmt
     ASK_AGENT_NAME, ASK_AGENT_TGID,
@@ -133,7 +135,7 @@ def canonical_owner_id(owner_id: int) -> int:
     ASK_AGENT_MAX_USERS, ASK_AGENT_MAX_USER_GB,
     ASK_ASSIGN_AGENT_PANELS,
     ASK_PANEL_REMOVE_CONFIRM,
-) = range(25)
+) = range(26)
 
 # ---------- MySQL ----------
 MYSQL_POOL = None
@@ -283,6 +285,34 @@ def ensure_schema():
                 panel_id BIGINT NOT NULL,
                 UNIQUE KEY uq_agent_panel(agent_tg_id, panel_id),
                 FOREIGN KEY (panel_id) REFERENCES panels(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+
+        # services
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS services(
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                owner_id BIGINT NOT NULL,
+                name VARCHAR(128) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_owner_name(owner_id, name)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS service_panels(
+                service_id BIGINT NOT NULL,
+                panel_id BIGINT NOT NULL,
+                UNIQUE KEY uq_service_panel(service_id, panel_id),
+                FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE,
+                FOREIGN KEY (panel_id) REFERENCES panels(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS service_users(
+                service_id BIGINT NOT NULL,
+                local_username VARCHAR(64) NOT NULL,
+                UNIQUE KEY uq_service_user(service_id, local_username),
+                FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
 
@@ -534,6 +564,11 @@ def list_user_links(owner_id: int, local_username: str):
         return cur.fetchall()
 
 
+def list_mapped_links(owner_id: int, local_username: str):
+    """Compatibility wrapper returning panel mappings for a user."""
+    return list_user_links(owner_id, local_username)
+
+
 def delete_local_user(owner_id: int, username: str):
     ids = expand_owner_ids(owner_id)
     placeholders = ",".join(["%s"] * len(ids))
@@ -675,6 +710,19 @@ def list_panel_links(panel_id: int):
             WHERE lup.panel_id=%s
         """, (int(panel_id),))
         return cur.fetchall()
+
+
+def disable_remote(panel_type, panel_url, token, remote_username):
+    """Disable a remote user across different panel types."""
+    api = get_api(panel_type)
+    remotes = remote_username.split(",") if panel_type == "sanaei" else [remote_username]
+    all_ok, last_msg = True, None
+    for rn in remotes:
+        ok, msg = api.disable_remote_user(panel_url, token, rn)
+        if not ok:
+            all_ok = False
+            last_msg = msg
+    return (200 if all_ok else None), last_msg
 
 def delete_panel_and_cleanup(owner_id: int, panel_id: int):
     # 1) disable all mapped remote users on that panel
@@ -905,6 +953,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
         kb = [
             [InlineKeyboardButton("➕ Add Panel", callback_data="add_panel")],
+            [InlineKeyboardButton("🧩 Add Service", callback_data="service_add")],
             [InlineKeyboardButton("🛠️ Manage Panels", callback_data="manage_panels")],
             [InlineKeyboardButton("👑 Manage Agents", callback_data="manage_agents")],
             [InlineKeyboardButton("⬅️ Back", callback_data="back_home")],
@@ -919,6 +968,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
         await q.edit_message_text("🧾 اسم پنل را بفرست:")
         return ASK_PANEL_NAME
+
+    if data == "service_add":
+        if not is_admin(uid):
+            await q.edit_message_text("فقط ادمین می‌تواند سرویس بسازد.")
+            return ConversationHandler.END
+        await q.edit_message_text("اسم سرویس را بفرست:")
+        return ASK_SERVICE_NAME
 
     if data == "manage_panels":
         if not is_admin(uid):
@@ -2296,6 +2352,21 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
         note += "\n⚠️ خطاها:\n" + "\n".join(f"• {e}" for e in added_errs[:10])
     await show_user_card(q, owner_id, username, notice=note)
 
+
+# ---------- services ----------
+async def got_service_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create a new service after receiving its name."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("دسترسی ندارید.")
+        return ConversationHandler.END
+    name = (update.message.text or "").strip()
+    if not name:
+        await update.message.reply_text("❌ اسم معتبر بفرست:")
+        return ASK_SERVICE_NAME
+    sid = services.create_service(name, canonical_owner_id(update.effective_user.id))
+    await update.message.reply_text(f"Service created with id {sid}")
+    return ConversationHandler.END
+
 # ---------- wiring ----------
 def build_app():
     load_dotenv()
@@ -2304,6 +2375,8 @@ def build_app():
         raise RuntimeError("BOT_TOKEN missing in .env")
     init_mysql_pool()
     ensure_schema()
+    services.set_pool(MYSQL_POOL)
+    services.set_helpers(disable_remote, list_mapped_links)
     app = Application.builder().token(tok).build()
 
     conv = ConversationHandler(
@@ -2322,6 +2395,7 @@ def build_app():
             ASK_EDIT_PANEL_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_edit_panel_user)],
             ASK_EDIT_PANEL_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_edit_panel_pass)],
             ASK_PANEL_SUB_URL:  [MessageHandler(filters.TEXT & ~filters.COMMAND, got_panel_sub_url)],
+            ASK_SERVICE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_service_name)],
             ASK_PANEL_REMOVE_CONFIRM: [CallbackQueryHandler(on_button)],
 
             # agent mgmt (admin)
