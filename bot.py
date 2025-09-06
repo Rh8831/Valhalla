@@ -27,6 +27,8 @@ import os
 import logging
 import secrets
 import re
+import json
+import uuid
 from urllib.parse import urlparse, unquote
 from datetime import datetime, timedelta, timezone
 
@@ -35,7 +37,7 @@ from mysql.connector import pooling, Error as MySQLError
 
 import marzneshin
 import marzban
-from marzneshin import fetch_subscription_links
+import sanaei
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -56,10 +58,35 @@ log = logging.getLogger("marz_bot")
 API_MODULES = {
     "marzneshin": marzneshin,
     "marzban": marzban,
+    "sanaei": sanaei,
 }
 
 def get_api(panel_type: str):
     return API_MODULES.get(panel_type or "marzneshin", marzneshin)
+
+# ---------- proxy helpers ----------
+def clone_proxy_settings(proxies: dict) -> dict:
+    """Copy proxy settings and regenerate credentials.
+
+    Ensures each created user receives unique identifiers instead of reusing
+    UUIDs or passwords from the template user.
+    """
+    cleaned = {}
+    for ptype, settings in (proxies or {}).items():
+        if not isinstance(settings, dict):
+            cleaned[ptype] = settings
+            continue
+        s = settings.copy()
+        if "id" in s:
+            s["id"] = str(uuid.uuid4())
+        if "uuid" in s:
+            s["uuid"] = str(uuid.uuid4())
+        if "password" in s:
+            s["password"] = secrets.token_hex(8)
+        if "pass" in s:
+            s["pass"] = secrets.token_hex(8)
+        cleaned[ptype] = s
+    return cleaned
 
 # ---------- roles ----------
 def admin_ids():
@@ -70,6 +97,25 @@ def admin_ids():
 
 def is_admin(tg_id: int) -> bool:
     return tg_id in admin_ids()
+
+def expand_owner_ids(owner_id: int) -> list[int]:
+    """Return list of relevant owner IDs for queries.
+
+    If the supplied owner_id belongs to an admin, include all admin IDs so
+    that multiple admins share the same data. Otherwise return the owner_id
+    itself.
+    """
+    ids = admin_ids()
+    return list(ids) if owner_id in ids else [owner_id]
+
+def canonical_owner_id(owner_id: int) -> int:
+    """Return canonical owner id for inserts/updates.
+
+    Data created by any admin is stored under the first admin id so other
+    admins can access it as well.
+    """
+    ids = expand_owner_ids(owner_id)
+    return ids[0]
 
 # ---------- states ----------
 (
@@ -84,9 +130,10 @@ def is_admin(tg_id: int) -> bool:
     # agent mgmt
     ASK_AGENT_NAME, ASK_AGENT_TGID,
     ASK_AGENT_LIMIT, ASK_AGENT_RENEW_DAYS,   # changed: renew by days
+    ASK_AGENT_MAX_USERS, ASK_AGENT_MAX_USER_GB,
     ASK_ASSIGN_AGENT_PANELS,
     ASK_PANEL_REMOVE_CONFIRM,
-) = range(23)
+) = range(25)
 
 # ---------- MySQL ----------
 MYSQL_POOL = None
@@ -214,11 +261,21 @@ def ensure_schema():
                 plan_limit_bytes BIGINT NOT NULL DEFAULT 0,
                 expire_at DATETIME NULL,
                 active TINYINT(1) NOT NULL DEFAULT 1,
+                user_limit BIGINT NOT NULL DEFAULT 0,
+                max_user_bytes BIGINT NOT NULL DEFAULT 0,
                 disabled_pushed TINYINT(1) NOT NULL DEFAULT 0,
                 disabled_pushed_at DATETIME NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
+        try:
+            cur.execute("ALTER TABLE agents ADD COLUMN user_limit BIGINT NOT NULL DEFAULT 0")
+        except MySQLError:
+            pass
+        try:
+            cur.execute("ALTER TABLE agents ADD COLUMN max_user_bytes BIGINT NOT NULL DEFAULT 0")
+        except MySQLError:
+            pass
         cur.execute("""
             CREATE TABLE IF NOT EXISTS agent_panels(
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -288,8 +345,13 @@ def make_panel_name(url, u):
 
 # ---------- data access ----------
 def list_my_panels_admin(admin_tg_id: int):
+    ids = expand_owner_ids(admin_tg_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with with_mysql_cursor() as cur:
-        cur.execute("SELECT * FROM panels WHERE telegram_user_id=%s ORDER BY created_at DESC", (admin_tg_id,))
+        cur.execute(
+            f"SELECT * FROM panels WHERE telegram_user_id IN ({placeholders}) ORDER BY created_at DESC",
+            tuple(ids),
+        )
         return cur.fetchall()
 
 def list_panels_for_agent(agent_tg_id: int):
@@ -303,18 +365,31 @@ def list_panels_for_agent(agent_tg_id: int):
         return cur.fetchall()
 
 def upsert_app_user(tg_id: int, u: str) -> str:
+    owner_ids = expand_owner_ids(tg_id)
+    placeholders = ",".join(["%s"] * len(owner_ids))
     with with_mysql_cursor() as cur:
-        cur.execute("SELECT app_key FROM app_users WHERE telegram_user_id=%s AND username=%s", (tg_id, u))
+        cur.execute(
+            f"SELECT app_key FROM app_users WHERE telegram_user_id IN ({placeholders}) AND username=%s",
+            tuple(owner_ids) + (u,),
+        )
         row = cur.fetchone()
         if row:
             return row["app_key"]
         k = secrets.token_hex(16)
-        cur.execute("INSERT INTO app_users(telegram_user_id,username,app_key)VALUES(%s,%s,%s)", (tg_id, u, k))
+        cur.execute(
+            "INSERT INTO app_users(telegram_user_id,username,app_key)VALUES(%s,%s,%s)",
+            (canonical_owner_id(tg_id), u, k),
+        )
         return k
 
 def get_app_key(tg_id: int, u: str) -> str:
+    owner_ids = expand_owner_ids(tg_id)
+    placeholders = ",".join(["%s"] * len(owner_ids))
     with with_mysql_cursor() as cur:
-        cur.execute("SELECT app_key FROM app_users WHERE telegram_user_id=%s AND username=%s", (tg_id, u))
+        cur.execute(
+            f"SELECT app_key FROM app_users WHERE telegram_user_id IN ({placeholders}) AND username=%s",
+            tuple(owner_ids) + (u,),
+        )
         row = cur.fetchone()
     return row["app_key"] if row else upsert_app_user(tg_id, u)
 
@@ -328,7 +403,7 @@ def upsert_local_user(owner_id: int, username: str, limit_bytes: int, duration_d
                    plan_limit_bytes=VALUES(plan_limit_bytes),
                    expire_at=VALUES(expire_at),
                    disabled_pushed=0""",
-            (owner_id, username, int(limit_bytes), exp)
+            (canonical_owner_id(owner_id), username, int(limit_bytes), exp)
         )
 
 def save_link(owner_id: int, local_username: str, panel_id: int, remote_username: str):
@@ -337,87 +412,190 @@ def save_link(owner_id: int, local_username: str, panel_id: int, remote_username
             """INSERT INTO local_user_panel_links(owner_id,local_username,panel_id,remote_username)
                VALUES(%s,%s,%s,%s)
                ON DUPLICATE KEY UPDATE remote_username=VALUES(remote_username)""",
-            (owner_id, local_username, panel_id, remote_username)
+            (canonical_owner_id(owner_id), local_username, panel_id, remote_username)
         )
 
 def remove_link(owner_id: int, local_username: str, panel_id: int):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with with_mysql_cursor() as cur:
         cur.execute(
-            "DELETE FROM local_user_panel_links WHERE owner_id=%s AND local_username=%s AND panel_id=%s",
-            (owner_id, local_username, panel_id)
+            f"DELETE FROM local_user_panel_links WHERE owner_id IN ({placeholders}) AND local_username=%s AND panel_id=%s",
+            tuple(ids) + (local_username, panel_id)
         )
 
 def list_linked_panel_ids(owner_id: int, local_username: str):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with with_mysql_cursor() as cur:
         cur.execute(
-            "SELECT panel_id FROM local_user_panel_links WHERE owner_id=%s AND local_username=%s",
-            (owner_id, local_username)
+            f"SELECT panel_id FROM local_user_panel_links WHERE owner_id IN ({placeholders}) AND local_username=%s",
+            tuple(ids) + (local_username,)
         )
         return {int(r["panel_id"]) for r in cur.fetchall()}
 
-def get_local_user(owner_id: int, username: str):
+def map_linked_remote_usernames(owner_id: int, local_username: str):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with with_mysql_cursor() as cur:
         cur.execute(
-            "SELECT username,plan_limit_bytes,used_bytes,expire_at,disabled_pushed FROM local_users "
-            "WHERE owner_id=%s AND username=%s LIMIT 1",
-            (owner_id, username)
+            f"SELECT panel_id, remote_username FROM local_user_panel_links WHERE owner_id IN ({placeholders}) AND local_username=%s",
+            tuple(ids) + (local_username,)
+        )
+        return {int(r["panel_id"]): r["remote_username"] for r in cur.fetchall()}
+
+def get_local_user(owner_id: int, username: str):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            f"SELECT username,plan_limit_bytes,used_bytes,expire_at,disabled_pushed FROM local_users "
+            f"WHERE owner_id IN ({placeholders}) AND username=%s LIMIT 1",
+            tuple(ids) + (username,)
         )
         return cur.fetchone()
 
 def search_local_users(owner_id: int, q: str):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with with_mysql_cursor() as cur:
         cur.execute(
-            "SELECT username FROM local_users WHERE owner_id=%s AND username LIKE %s ORDER BY username ASC LIMIT 50",
-            (owner_id, f"%{q}%")
+            f"SELECT username FROM local_users WHERE owner_id IN ({placeholders}) AND username LIKE %s ORDER BY username ASC LIMIT 50",
+            tuple(ids) + (f"%{q}%",)
         )
         return cur.fetchall()
 
 def list_all_local_users(owner_id: int, offset: int = 0, limit: int = 25):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with with_mysql_cursor() as cur:
         cur.execute(
-            "SELECT username FROM local_users WHERE owner_id=%s ORDER BY username ASC LIMIT %s OFFSET %s",
-            (owner_id, limit, offset)
+            f"SELECT username FROM local_users WHERE owner_id IN ({placeholders}) ORDER BY username ASC LIMIT %s OFFSET %s",
+            tuple(ids) + (limit, offset)
         )
         return cur.fetchall()
 
 def count_local_users(owner_id: int) -> int:
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
     with with_mysql_cursor() as cur:
-        cur.execute("SELECT COUNT(*) c FROM local_users WHERE owner_id=%s", (owner_id,))
+        cur.execute(
+            f"SELECT COUNT(*) c FROM local_users WHERE owner_id IN ({placeholders})",
+            tuple(ids)
+        )
         return int(cur.fetchone()["c"])
 
 def update_limit(owner_id: int, username: str, new_limit_bytes: int):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    params = [int(new_limit_bytes)] + ids + [username]
     with with_mysql_cursor() as cur:
         cur.execute(
-            "UPDATE local_users SET plan_limit_bytes=%s WHERE owner_id=%s AND username=%s",
-            (int(new_limit_bytes), owner_id, username)
+            f"UPDATE local_users SET plan_limit_bytes=%s WHERE owner_id IN ({placeholders}) AND username=%s",
+            params
         )
 
 def reset_used(owner_id: int, username: str):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    params = ids + [username]
     with with_mysql_cursor() as cur:
         cur.execute(
-            "UPDATE local_users SET used_bytes=0 WHERE owner_id=%s AND username=%s",
-            (owner_id, username)
+            f"UPDATE local_users SET used_bytes=0 WHERE owner_id IN ({placeholders}) AND username=%s",
+            params
         )
 
 def renew_user(owner_id: int, username: str, add_days: int):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    params = [add_days, add_days] + ids + [username]
     with with_mysql_cursor() as cur:
         cur.execute(
-            """UPDATE local_users
+            f"""UPDATE local_users
                SET expire_at = IF(expire_at IS NULL, UTC_TIMESTAMP() + INTERVAL %s DAY,
                                     expire_at + INTERVAL %s DAY)
-               WHERE owner_id=%s AND username=%s""",
-            (add_days, add_days, owner_id, username)
+               WHERE owner_id IN ({placeholders}) AND username=%s""",
+            params
         )
+
+
+def list_user_links(owner_id: int, local_username: str):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            f"""SELECT lup.panel_id, lup.remote_username,
+                      p.panel_url, p.access_token, p.panel_type
+                 FROM local_user_panel_links lup
+                 JOIN panels p ON p.id = lup.panel_id
+                 WHERE lup.owner_id IN ({placeholders}) AND lup.local_username=%s""",
+            tuple(ids) + (local_username,),
+        )
+        return cur.fetchall()
+
+
+def delete_local_user(owner_id: int, username: str):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    params = tuple(ids) + (username,)
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            f"DELETE FROM local_user_panel_links WHERE owner_id IN ({placeholders}) AND local_username=%s",
+            params,
+        )
+        cur.execute(
+            f"DELETE FROM local_users WHERE owner_id IN ({placeholders}) AND username=%s",
+            params,
+        )
+        cur.execute(
+            f"DELETE FROM app_users WHERE telegram_user_id IN ({placeholders}) AND username=%s",
+            params,
+        )
+
+
+def delete_user(owner_id: int, username: str):
+    rows = list_user_links(owner_id, username)
+    for r in rows:
+        try:
+            api = get_api(r.get("panel_type"))
+            remotes = (
+                r["remote_username"].split(",")
+                if r.get("panel_type") == "sanaei"
+                else [r["remote_username"]]
+            )
+            for rn in remotes:
+                ok, err = api.remove_remote_user(r["panel_url"], r["access_token"], rn)
+                if not ok:
+                    log.warning(
+                        "remote delete failed on %s@%s: %s",
+                        rn,
+                        r["panel_url"],
+                        err or "unknown",
+                    )
+        except Exception as e:
+            log.warning("remote delete exception: %s", e)
+    delete_local_user(owner_id, username)
 
 # panels extra
 def set_panel_sub_url(owner_id: int, panel_id: int, sub_url: str | None):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    params = [sub_url, int(panel_id)] + ids
     with with_mysql_cursor() as cur:
-        cur.execute("UPDATE panels SET sub_url=%s WHERE id=%s AND telegram_user_id=%s",
-                    (sub_url, int(panel_id), owner_id))
+        cur.execute(
+            f"UPDATE panels SET sub_url=%s WHERE id=%s AND telegram_user_id IN ({placeholders})",
+            params
+        )
 
 def get_panel(owner_id: int, panel_id: int):
+    ids = expand_owner_ids(owner_id)
+    placeholders = ",".join(["%s"] * len(ids))
+    params = [int(panel_id)] + ids
     with with_mysql_cursor() as cur:
-        cur.execute("SELECT * FROM panels WHERE id=%s AND telegram_user_id=%s", (int(panel_id), owner_id))
+        cur.execute(
+            f"SELECT * FROM panels WHERE id=%s AND telegram_user_id IN ({placeholders})",
+            params
+        )
         return cur.fetchone()
 
 def canonicalize_name(name: str) -> str:
@@ -463,7 +641,7 @@ def set_panel_disabled_names(owner_id: int, panel_id: int, names):
                 INSERT INTO panel_disabled_configs(telegram_user_id,panel_id,config_name)
                 VALUES(%s,%s,%s)
                 """,
-                [(owner_id, int(panel_id), n) for n in clean],
+                [(canonical_owner_id(owner_id), int(panel_id), n) for n in clean],
             )
 
 def get_panel_disabled_nums(panel_id: int):
@@ -484,7 +662,7 @@ def set_panel_disabled_nums(owner_id: int, panel_id: int, nums):
                 INSERT INTO panel_disabled_numbers(telegram_user_id,panel_id,config_index)
                 VALUES(%s,%s,%s)
                 """,
-                [(owner_id, int(panel_id), n) for n in clean],
+                [(canonical_owner_id(owner_id), int(panel_id), n) for n in clean],
             )
 
 def list_panel_links(panel_id: int):
@@ -504,9 +682,15 @@ def delete_panel_and_cleanup(owner_id: int, panel_id: int):
     for r in rows:
         try:
             api = get_api(r.get("panel_type"))
-            ok, err = api.disable_remote_user(r["panel_url"], r["access_token"], r["remote_username"])
-            if not ok:
-                log.warning("disable before delete failed on %s: %s", r["panel_url"], err or "unknown")
+            remotes = (
+                r["remote_username"].split(",")
+                if r.get("panel_type") == "sanaei"
+                else [r["remote_username"]]
+            )
+            for rn in remotes:
+                ok, err = api.disable_remote_user(r["panel_url"], r["access_token"], rn)
+                if not ok:
+                    log.warning("disable before delete failed on %s: %s", r["panel_url"], err or "unknown")
         except Exception as e:
             log.warning("disable before delete exception: %s", e)
     # 2) delete mappings + panel
@@ -514,7 +698,12 @@ def delete_panel_and_cleanup(owner_id: int, panel_id: int):
         cur.execute("DELETE FROM local_user_panel_links WHERE panel_id=%s", (int(panel_id),))
         cur.execute("DELETE FROM panel_disabled_configs WHERE panel_id=%s", (int(panel_id),))
         cur.execute("DELETE FROM panel_disabled_numbers WHERE panel_id=%s", (int(panel_id),))
-        cur.execute("DELETE FROM panels WHERE id=%s AND telegram_user_id=%s", (int(panel_id), owner_id))
+        ids = expand_owner_ids(owner_id)
+        placeholders = ",".join(["%s"] * len(ids))
+        cur.execute(
+            f"DELETE FROM panels WHERE id=%s AND telegram_user_id IN ({placeholders})",
+            [int(panel_id)] + ids
+        )
 
 # ---------- agents ----------
 def upsert_agent(tg_id: int, name: str):
@@ -524,8 +713,11 @@ def upsert_agent(tg_id: int, name: str):
         if row:
             cur.execute("UPDATE agents SET name=%s, active=1 WHERE telegram_user_id=%s", (name, tg_id))
         else:
-            cur.execute("INSERT INTO agents(telegram_user_id,name,plan_limit_bytes,expire_at,active) VALUES(%s,%s,0,NULL,1)",
-                        (tg_id, name))
+            cur.execute(
+                "INSERT INTO agents(telegram_user_id,name,plan_limit_bytes,expire_at,active,user_limit,max_user_bytes) "
+                "VALUES(%s,%s,0,NULL,1,0,0)",
+                (tg_id, name)
+            )
 
 def get_agent(tg_id: int):
     with with_mysql_cursor() as cur:
@@ -540,6 +732,20 @@ def set_agent_quota(tg_id: int, limit_bytes: int):
         usage_sync.sync_agent_now(tg_id)
     except Exception as e:
         log.warning("sync_agent_now failed for %s: %s", tg_id, e)
+
+def set_agent_user_limit(tg_id: int, max_users: int):
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            "UPDATE agents SET user_limit=%s WHERE telegram_user_id=%s",
+            (int(max_users), tg_id),
+        )
+
+def set_agent_max_user_bytes(tg_id: int, max_bytes: int):
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            "UPDATE agents SET max_user_bytes=%s WHERE telegram_user_id=%s",
+            (int(max_bytes), tg_id),
+        )
 
 def renew_agent_days(tg_id: int, add_days: int):
     # if no expire_at -> set now + days; else add days
@@ -577,14 +783,29 @@ def set_agent_panels(agent_tg_id: int, panel_ids: set[int]):
 # ---------- UI ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    header = ""
+    if not is_admin(uid):
+        ag = get_agent(uid)
+        if ag:
+            limit_b = int(ag.get("plan_limit_bytes") or 0)
+            max_users = int(ag.get("user_limit") or 0)
+            max_user_b = int(ag.get("max_user_bytes") or 0)
+            user_cnt = count_local_users(uid)
+            exp = ag.get("expire_at")
+            parts = [f"👤 <b>{ag['name']}</b>", f"👥 Users: {user_cnt}/{('∞' if max_users==0 else max_users)}"]
+            if limit_b:
+                parts.append(f"📦 Quota: {fmt_bytes_short(limit_b)}")
+            if max_user_b:
+                parts.append(f"📛 Max/User: {fmt_bytes_short(max_user_b)}")
+            if exp:
+                parts.append(f"⏳ Expire: {exp.strftime('%Y-%m-%d')}")
+            header = "\n".join(parts) + "\n\n"
     if is_admin(uid):
         kb = [
-            [InlineKeyboardButton("➕ Add Panel", callback_data="add_panel")],
-            [InlineKeyboardButton("🛠️ Manage Panels", callback_data="manage_panels")],
-            [InlineKeyboardButton("👑 Manage Agents", callback_data="manage_agents")],
             [InlineKeyboardButton("🧬 New Local User", callback_data="new_user")],
             [InlineKeyboardButton("🔍 Search User", callback_data="search_user")],
             [InlineKeyboardButton("👥 List Users", callback_data="list_users:0")],
+            [InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")],
         ]
     else:
         kb = [
@@ -592,10 +813,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🔍 Search User", callback_data="search_user")],
             [InlineKeyboardButton("👥 List Users", callback_data="list_users:0")],
         ]
+    text = header + "Choose an option:"
     if update.message:
-        await update.message.reply_text("Choose an option:", reply_markup=InlineKeyboardMarkup(kb))
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     else:
-        await update.callback_query.edit_message_text("Choose an option:", reply_markup=InlineKeyboardMarkup(kb))
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
 
 def _panel_select_kb(panels, selected: set, mode: str):
     rows = []
@@ -639,9 +861,12 @@ async def show_panel_select(update_or_q, context, owner_id: int, mode: str, user
         return ConversationHandler.END
 
     if mode == "create":
-        panels = [p for p in panels if p.get("template_username")]
+        panels = [
+            p for p in panels
+            if not ((p.get("panel_type") in ("marzneshin", "sanaei")) and not p.get("template_username"))
+        ]
         if not panels:
-            txt = "⚠️ هیچ پنلی template ندارد. از 🛠️ Manage Panels تنظیم کن."
+            txt = "⚠️ هیچ پنلی template/inbound ندارد. از 🛠️ Manage Panels تنظیم کن."
             if hasattr(update_or_q, "edit_message_text"):
                 await update_or_q.edit_message_text(txt)
             else:
@@ -673,6 +898,19 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data
     uid = update.effective_user.id
+
+    if data == "admin_panel":
+        if not is_admin(uid):
+            await q.edit_message_text("دسترسی ندارید.")
+            return ConversationHandler.END
+        kb = [
+            [InlineKeyboardButton("➕ Add Panel", callback_data="add_panel")],
+            [InlineKeyboardButton("🛠️ Manage Panels", callback_data="manage_panels")],
+            [InlineKeyboardButton("👑 Manage Agents", callback_data="manage_agents")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="back_home")],
+        ]
+        await q.edit_message_text("پنل ادمین:", reply_markup=InlineKeyboardMarkup(kb))
+        return ConversationHandler.END
 
     # --- admin/agent shared
     if data == "add_panel":
@@ -706,7 +944,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "p_set_template":
         if not is_admin(uid): return ConversationHandler.END
-        await q.edit_message_text("نام تمپلیت را بفرست (برای حذف، '-'):") ; return ASK_PANEL_TEMPLATE
+        pid = context.user_data.get("edit_panel_id")
+        info = get_panel(uid, pid) if pid else None
+        prompt = (
+            "ID اینباندها (با کاما جدا کن)" if info and info.get("panel_type") == "sanaei" else "نام تمپلیت"
+        )
+        await q.edit_message_text(f"{prompt} را بفرست (برای حذف، '-'):") ; return ASK_PANEL_TEMPLATE
     if data == "p_rename":
         if not is_admin(uid): return ConversationHandler.END
         await q.edit_message_text("اسم جدید پنل را بفرست:") ; return ASK_EDIT_PANEL_NAME
@@ -715,6 +958,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("یوزرنیم ادمین جدید را بفرست:") ; return ASK_EDIT_PANEL_USER
     if data == "p_set_sub":
         if not is_admin(uid): return ConversationHandler.END
+        pid = context.user_data.get("edit_panel_id")
+        info = get_panel(uid, pid) if pid else None
+        if info and info.get("panel_type") == "sanaei":
+            await q.edit_message_text("این پنل از لینک سابسکریپشن پشتیبانی نمی‌کند.")
+            return ConversationHandler.END
         await q.edit_message_text("لینک سابسکریپشن پنل را بفرست (برای حذف، '-'):") ; return ASK_PANEL_SUB_URL
     if data == "p_filter_cfgs":
         if not is_admin(uid): return ConversationHandler.END
@@ -722,6 +970,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = get_panel(uid, pid)
         if not info:
             await q.edit_message_text("پنل پیدا نشد.")
+            return ConversationHandler.END
+        if info.get("panel_type") == "sanaei":
+            await q.edit_message_text("این پنل از فیلتر کانفیگ‌ها پشتیبانی نمی‌کند.")
             return ConversationHandler.END
         if not info.get("sub_url"):
             await q.edit_message_text("اول لینک سابسکریپشن پنل را تنظیم کن (Set/Clear Sub URL).")
@@ -733,6 +984,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = get_panel(uid, pid)
         if not info:
             await q.edit_message_text("پنل پیدا نشد.")
+            return ConversationHandler.END
+        if info.get("panel_type") == "sanaei":
+            await q.edit_message_text("این پنل از فیلتر کانفیگ‌ها پشتیبانی نمی‌کند.")
             return ConversationHandler.END
         if not info.get("sub_url"):
             await q.edit_message_text("اول لینک سابسکریپشن پنل را تنظیم کن (Set/Clear Sub URL).")
@@ -808,6 +1062,27 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
         return await show_panel_select(q, context, uid, mode="edit", username=uname)
 
+    if data == "act_del_user":
+        uname = context.user_data.get("manage_username")
+        if not uname:
+            await q.edit_message_text("یوزر انتخاب نشده.")
+            return ConversationHandler.END
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ بله، حذف کن", callback_data="act_del_user_yes")],
+            [InlineKeyboardButton("⬅️ انصراف", callback_data=f"user_sel:{uname}")],
+        ])
+        await q.edit_message_text(f"کاربر {uname} حذف شود؟", reply_markup=kb)
+        return ConversationHandler.END
+
+    if data == "act_del_user_yes":
+        uname = context.user_data.get("manage_username")
+        if not uname:
+            await q.edit_message_text("یوزر انتخاب نشده.")
+            return ConversationHandler.END
+        delete_user(uid, uname)
+        await q.edit_message_text("✅ کاربر حذف شد.")
+        return ConversationHandler.END
+
     # ----- agent mgmt (admin) -----
     if data == "manage_agents":
         if not is_admin(uid):
@@ -835,6 +1110,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(uid): return ConversationHandler.END
         await q.edit_message_text("حجم کل نماینده (مثلا 200GB یا 0=نامحدود):")
         return ASK_AGENT_LIMIT
+
+    if data == "agent_set_user_limit":
+        if not is_admin(uid): return ConversationHandler.END
+        await q.edit_message_text("حداکثر تعداد یوزر (0=نامحدود):")
+        return ASK_AGENT_MAX_USERS
+
+    if data == "agent_set_max_user":
+        if not is_admin(uid): return ConversationHandler.END
+        await q.edit_message_text("حداکثر حجم هر یوزر (مثلا 50GB یا 0=نامحدود):")
+        return ASK_AGENT_MAX_USER_GB
 
     if data == "agent_renew_days":
         if not is_admin(uid): return ConversationHandler.END
@@ -1092,7 +1377,7 @@ async def show_panel_cfg_selector(q, context: ContextTypes.DEFAULT_TYPE, owner_i
         if u and u.get("key"):
             links = api.fetch_links_from_panel(info["panel_url"], info["template_username"], u["key"])
     elif info.get("sub_url"):
-        links = fetch_subscription_links(info["sub_url"])
+        links = api.fetch_subscription_links(info["sub_url"])
     if not links:
         await q.edit_message_text("ابتدا template یا لینک سابسکریپشن را تنظیم کن.")
         return ConversationHandler.END
@@ -1131,7 +1416,7 @@ async def show_panel_cfgnum_selector(q, context: ContextTypes.DEFAULT_TYPE, owne
         if u and u.get("key"):
             links = api.fetch_links_from_panel(info["panel_url"], info["template_username"], u["key"])
     elif info.get("sub_url"):
-        links = fetch_subscription_links(info["sub_url"])
+        links = api.fetch_subscription_links(info["sub_url"])
     if not links:
         await q.edit_message_text("ابتدا template یا لینک سابسکریپشن را تنظیم کن.")
         return ConversationHandler.END
@@ -1158,26 +1443,32 @@ async def show_panel_card(q, context: ContextTypes.DEFAULT_TYPE, owner_id: int, 
         await q.edit_message_text("پنل پیدا نشد.")
         return ConversationHandler.END
 
+    is_sanaei = p.get('panel_type') == 'sanaei'
+    label = "Inbound" if is_sanaei else "Template"
     lines = [
         f"🧩 <b>{p['name']}</b>",
         f"📦 Type: <b>{p.get('panel_type', 'marzneshin')}</b>",
         f"🌐 URL: <code>{p['panel_url']}</code>",
         f"👤 Admin: <code>{p['admin_username']}</code>",
-        f"🧬 Template: <b>{p.get('template_username') or '-'}</b>",
-        f"🔗 Sub URL: <code>{p.get('sub_url') or '-'}</code>",
+        f"🧬 {label}: <b>{p.get('template_username') or '-'}</b>",
+    ]
+    if not is_sanaei:
+        lines.append(f"🔗 Sub URL: <code>{p.get('sub_url') or '-'}</code>")
+    lines += [
         "",
         "چه کاری انجام بدهم؟",
     ]
     kb = [
-        [InlineKeyboardButton("🧬 Set/Clear Template", callback_data="p_set_template")],
+        [InlineKeyboardButton(f"🧬 Set/Clear {label}", callback_data="p_set_template")],
         [InlineKeyboardButton("🔑 Change Admin Credentials", callback_data="p_change_creds")],
         [InlineKeyboardButton("✏️ Rename Panel", callback_data="p_rename")],
-        [InlineKeyboardButton("🔗 Set/Clear Sub URL", callback_data="p_set_sub")],
-        [InlineKeyboardButton("🧷 فیلتر کانفیگ‌های پنل", callback_data="p_filter_cfgs")],
-        [InlineKeyboardButton("🔢 فیلتر بر اساس شماره", callback_data="p_filter_cfgnums")],
-        [InlineKeyboardButton("🗑️ Remove Panel", callback_data="p_remove")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="manage_panels")],
     ]
+    if not is_sanaei:
+        kb.append([InlineKeyboardButton("🔗 Set/Clear Sub URL", callback_data="p_set_sub")])
+        kb.append([InlineKeyboardButton("🧷 فیلتر کانفیگ‌های پنل", callback_data="p_filter_cfgs")])
+        kb.append([InlineKeyboardButton("🔢 فیلتر بر اساس شماره", callback_data="p_filter_cfgnums")])
+    kb.append([InlineKeyboardButton("🗑️ Remove Panel", callback_data="p_remove")])
+    kb.append([InlineKeyboardButton("⬅️ Back", callback_data="manage_panels")])
     await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     return ConversationHandler.END
 
@@ -1215,6 +1506,7 @@ async def show_user_card(q, owner_id: int, uname: str, notice: str = None):
         [InlineKeyboardButton("🧹 Reset Used", callback_data="act_reset_used")],
         [InlineKeyboardButton("🔁 Renew (add days)", callback_data="act_renew")],
         [InlineKeyboardButton("🧩 Panels", callback_data="act_user_panels")],
+        [InlineKeyboardButton("🗑️ Delete User", callback_data="act_del_user")],
         [InlineKeyboardButton("⬅️ Back", callback_data="list_users:0")],
     ]
     await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
@@ -1230,11 +1522,16 @@ async def show_agent_card(q, context: ContextTypes.DEFAULT_TYPE, agent_tg_id: in
     limit_b = int(a.get("plan_limit_bytes") or 0)
     exp = a.get("expire_at")
     active = bool(a.get("active", 1))
+    max_users = int(a.get("user_limit") or 0)
+    max_user_b = int(a.get("max_user_bytes") or 0)
+    user_cnt = count_local_users(agent_tg_id)
     lines = []
     if notice: lines.append(notice)
     lines += [
         f"👤 <b>{a['name']}</b> (TG: <code>{a['telegram_user_id']}</code>)",
         f"📦 Agent Quota: <b>{'Unlimited' if limit_b==0 else fmt_bytes_short(limit_b)}</b>",
+        f"👥 Users: <b>{user_cnt}</b> / <b>{'Unlimited' if max_users==0 else max_users}</b>",
+        f"📛 Max/User: <b>{'Unlimited' if max_user_b==0 else fmt_bytes_short(max_user_b)}</b>",
         f"⏳ Agent Expire: <b>{(exp.strftime('%Y-%m-%d %H:%M:%S UTC') if exp else '—')}</b>",
         f"✅ Active: <b>{'Yes' if active else 'No'}</b>",
         "",
@@ -1242,6 +1539,8 @@ async def show_agent_card(q, context: ContextTypes.DEFAULT_TYPE, agent_tg_id: in
     ]
     kb = [
         [InlineKeyboardButton("✏️ Set Quota", callback_data="agent_set_quota")],
+        [InlineKeyboardButton("👥 Set User Limit", callback_data="agent_set_user_limit")],
+        [InlineKeyboardButton("📛 Set Max/User", callback_data="agent_set_max_user")],
         [InlineKeyboardButton("🔁 Renew (days)", callback_data="agent_renew_days")],
         [InlineKeyboardButton("🧩 Assign Panels", callback_data="agent_assign_panels")],
         [InlineKeyboardButton("🔘 Toggle Active", callback_data="agent_toggle_active")],
@@ -1269,15 +1568,15 @@ async def got_panel_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ اسم معتبر بفرست:")
         return ASK_PANEL_NAME
     context.user_data["panel_name"] = name
-    await update.message.reply_text("نوع پنل را مشخص کن (marzneshin/marzban):")
+    await update.message.reply_text("نوع پنل را مشخص کن (marzneshin/marzban/sanaei):")
     return ASK_PANEL_TYPE
 
 async def got_panel_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     t = (update.message.text or "").strip().lower()
-    if t not in ("marzneshin", "marzban"):
-        await update.message.reply_text("❌ نوع پنل نامعتبر. marzneshin یا marzban بفرست:")
+    if t not in ("marzneshin", "marzban", "sanaei"):
+        await update.message.reply_text("❌ نوع پنل نامعتبر. یکی از marzneshin/marzban/sanaei بفرست:")
         return ASK_PANEL_TYPE
     context.user_data["panel_type"] = t
     await update.message.reply_text("🌐 URL پنل (مثال https://panel.example.com):")
@@ -1324,9 +1623,12 @@ async def got_panel_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "INSERT INTO panels(telegram_user_id,panel_url,name,panel_type,admin_username,access_token)VALUES(%s,%s,%s,%s,%s,%s)",
                 (update.effective_user.id, panel_url, panel_name, panel_type, panel_user, tok)
             )
-        await update.message.reply_text(
-            f"✅ پنل اضافه شد: {panel_name}\nنکته: از 🛠️ Manage Panels می‌تونی Template و Sub URL را ست کنی."
-        )
+        msg = f"✅ پنل اضافه شد: {panel_name}"
+        if panel_type == "sanaei":
+            msg += "\nنکته: از 🛠️ Manage Panels می‌تونی Inbound ID را ست کنی."
+        else:
+            msg += "\nنکته: از 🛠️ Manage Panels می‌تونی Template و Sub URL را ست کنی."
+        await update.message.reply_text(msg)
     except MySQLError as e:
         await update.message.reply_text(f"❌ خطای DB: {e}")
     except Exception as e:
@@ -1346,10 +1648,21 @@ async def got_panel_template(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
     txt = (update.message.text or "").strip()
     val = None if txt == "-" else txt
+    info = get_panel(update.effective_user.id, pid)
+    if val and info and info.get("panel_type") == "sanaei":
+        parts = [p.strip() for p in val.split(",") if p.strip().isdigit()]
+        if not parts:
+            await update.message.reply_text("❌ شناسه‌های اینباند نامعتبر است.")
+            return ASK_PANEL_TEMPLATE
+        val = ",".join(parts)
     try:
         with with_mysql_cursor() as cur:
-            cur.execute("UPDATE panels SET template_username=%s WHERE id=%s AND telegram_user_id=%s",
-                        (val, pid, update.effective_user.id))
+            ids = expand_owner_ids(update.effective_user.id)
+            placeholders = ",".join(["%s"] * len(ids))
+            cur.execute(
+                f"UPDATE panels SET template_username=%s WHERE id=%s AND telegram_user_id IN ({placeholders})",
+                tuple([val, pid] + ids),
+            )
         class FakeCQ:
             async def edit_message_text(self, *args, **kwargs):
                 await update.message.reply_text(*args, **kwargs)
@@ -1368,7 +1681,12 @@ async def got_edit_panel_name(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
     try:
         with with_mysql_cursor() as cur:
-            cur.execute("UPDATE panels SET name=%s WHERE id=%s AND telegram_user_id=%s", (new, pid, update.effective_user.id))
+            ids = expand_owner_ids(update.effective_user.id)
+            placeholders = ",".join(["%s"] * len(ids))
+            cur.execute(
+                f"UPDATE panels SET name=%s WHERE id=%s AND telegram_user_id IN ({placeholders})",
+                tuple([new, pid] + ids),
+            )
         class FakeCQ:
             async def edit_message_text(self, *args, **kwargs):
                 await update.message.reply_text(*args, **kwargs)
@@ -1397,10 +1715,12 @@ async def got_edit_panel_pass(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ ورودی نامعتبر.")
         return ConversationHandler.END
     try:
+        ids = expand_owner_ids(update.effective_user.id)
+        placeholders = ",".join(["%s"] * len(ids))
         with with_mysql_cursor() as cur:
             cur.execute(
-                "SELECT panel_url, panel_type FROM panels WHERE id=%s AND telegram_user_id=%s",
-                (pid, update.effective_user.id),
+                f"SELECT panel_url, panel_type FROM panels WHERE id=%s AND telegram_user_id IN ({placeholders})",
+                tuple([pid] + ids),
             )
             row = cur.fetchone()
         if not row:
@@ -1410,8 +1730,10 @@ async def got_edit_panel_pass(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not tok:
             raise RuntimeError(f"login failed: {err}")
         with with_mysql_cursor() as cur:
-            cur.execute("UPDATE panels SET admin_username=%s, access_token=%s WHERE id=%s AND telegram_user_id=%s",
-                        (new_user, tok, pid, update.effective_user.id))
+            cur.execute(
+                f"UPDATE panels SET admin_username=%s, access_token=%s WHERE id=%s AND telegram_user_id IN ({placeholders})",
+                tuple([new_user, tok, pid] + ids),
+            )
         context.user_data.pop("new_admin_user", None)
         class FakeCQ:
             async def edit_message_text(self, *args, **kwargs):
@@ -1498,17 +1820,64 @@ async def got_agent_renew_days(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text(*a, **k)
     return await show_agent_card(Fake(), context, a, notice=f"✅ {days} روز به انقضا اضافه شد.")
 
+async def got_agent_user_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    a = context.user_data.get("agent_tg_id") or 0
+    try:
+        num = int((update.message.text or "0").strip())
+        assert num >= 0
+    except Exception:
+        await update.message.reply_text("❌ یک عدد صحیح بفرست (مثلا 100 یا 0).")
+        return ASK_AGENT_MAX_USERS
+    set_agent_user_limit(a, num)
+    class Fake:
+        async def edit_message_text(self, *a, **k):
+            await update.message.reply_text(*a, **k)
+    return await show_agent_card(Fake(), context, a, notice="✅ محدودیت تعداد ذخیره شد.")
+
+async def got_agent_max_user_gb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    a = context.user_data.get("agent_tg_id") or 0
+    limit_b = parse_human_size(update.message.text or "0")
+    set_agent_max_user_bytes(a, limit_b)
+    class Fake:
+        async def edit_message_text(self, *a, **k):
+            await update.message.reply_text(*a, **k)
+    return await show_agent_card(Fake(), context, a, notice="✅ حداکثر حجم هر یوزر ذخیره شد.")
+
 # ---------- new user flow ----------
 async def got_newuser_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_username"] = (update.message.text or "").strip()
     if not context.user_data["new_username"]:
         await update.message.reply_text("❌ خالیه. دوباره بفرست:")
         return ASK_NEWUSER_NAME
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        ag = get_agent(uid) or {}
+        limit = int(ag.get("user_limit") or 0)
+        max_user_bytes = int(ag.get("max_user_bytes") or 0)
+        context.user_data["agent_max_user_bytes"] = max_user_bytes
+        if limit > 0:
+            total = count_local_users(uid)
+            exists = get_local_user(uid, context.user_data["new_username"])
+            if not exists and total >= limit:
+                await update.message.reply_text("❌ به حد مجاز تعداد کاربران رسیده‌اید.")
+                return ConversationHandler.END
+    else:
+        context.user_data["agent_max_user_bytes"] = 0
     await update.message.reply_text("حجم در GB (0=نامحدود):")
     return ASK_LIMIT_GB
 
 async def got_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["limit_bytes"] = gb_to_bytes(update.message.text or "0")
+    limit_b = gb_to_bytes(update.message.text or "0")
+    max_b = int(context.user_data.get("agent_max_user_bytes") or 0)
+    if max_b > 0 and limit_b > max_b:
+        await update.message.reply_text(
+            f"❌ حداکثر حجم مجاز {fmt_bytes_short(max_b)} است. دوباره بفرست:")
+        return ASK_LIMIT_GB
+    context.user_data["limit_bytes"] = limit_b
     await update.message.reply_text("مدت استفاده به روز (مثلا 30):")
     return ASK_DURATION
 
@@ -1583,28 +1952,60 @@ async def finalize_create_on_selected(q, context, owner_id: int, selected_ids: s
 
     panels = list_panels_for_agent(owner_id) if not is_admin(owner_id) else list_my_panels_admin(owner_id)
     rows = [p for p in panels if int(p["id"]) in selected_ids]
-    missing = [f"{r['name']}" for r in rows if r.get("panel_type") == "marzneshin" and not r.get("template_username")]
+    missing = [
+        f"{r['name']}"
+        for r in rows
+        if (r.get("panel_type") in ("marzneshin", "sanaei")) and not r.get("template_username")
+    ]
     if missing:
-        await q.edit_message_text("⚠️ این پنل‌ها template ندارند:\n" + "\n".join(f"• {m}" for m in missing))
+        await q.edit_message_text(
+            "⚠️ این پنل‌ها template/inbound ندارند:\n" + "\n".join(f"• {m}" for m in missing)
+        )
         return
 
     per_panel, errs = {}, []
     for r in rows:
         api = get_api(r.get("panel_type"))
         if r.get("panel_type") == "marzneshin":
-            svc, e = api.fetch_user_services(r["panel_url"], r["access_token"], r.get("template_username"))
+            svc, e = api.fetch_user_services(
+                r["panel_url"], r["access_token"], r.get("template_username")
+            )
             if e:
-                errs.append(f"{r['panel_url']} (template '{r['template_username']}'): {e}")
-            per_panel[r["id"]] = svc or []
+                errs.append(
+                    f"{r['panel_url']} (template '{r['template_username']}'): {e}"
+                )
+            per_panel[r["id"]] = {"service_ids": svc or []}
+        elif r.get("panel_type") == "sanaei":
+            ids = [x.strip() for x in (r.get("template_username") or "").split(",") if x.strip().isdigit()]
+            per_panel[r["id"]] = {"inbound_ids": ids}
         else:
-            per_panel[r["id"]] = []
+            tmpl = r.get("template_username")
+            if not tmpl:
+                errs.append(f"{r['panel_url']}: template missing")
+                per_panel[r["id"]] = {"proxies": {}, "inbounds": {}}
+                continue
+            obj, e = api.get_user(r["panel_url"], r["access_token"], tmpl)
+            if not obj:
+                errs.append(
+                    f"{r['panel_url']} (template '{tmpl}'): {e or 'not found'}"
+                )
+                per_panel[r["id"]] = {"proxies": {}, "inbounds": {}}
+                continue
+            per_panel[r["id"]] = {
+                "proxies": obj.get("proxies") or {},
+                "inbounds": obj.get("inbounds") or {},
+            }
     if errs:
-        await q.edit_message_text("❌ خطا در خواندن سرویس بعضی پنل‌ها:\n" + "\n".join(f"• {e}" for e in errs[:10]))
+        await q.edit_message_text(
+            "❌ خطا در خواندن سرویس بعضی پنل‌ها:\n" +
+            "\n".join(f"• {e}" for e in errs[:10])
+        )
         return
 
     ok, failed = 0, []
     for r in rows:
         api = get_api(r.get("panel_type"))
+        remote_name = app_username
         if r.get("panel_type") == "marzneshin":
             payload = {
                 "username": app_username,
@@ -1613,29 +2014,67 @@ async def finalize_create_on_selected(q, context, owner_id: int, selected_ids: s
                 "data_limit": limit_bytes,
                 "data_limit_reset_strategy": "no_reset",
                 "note": "created_by_bot",
-                "service_ids": per_panel.get(r["id"], []),
+                "service_ids": per_panel.get(r["id"], {}).get("service_ids", []),
             }
+        elif r.get("panel_type") == "sanaei":
+            expire_ts = 0 if usage_sec <= 0 else int(datetime.now(timezone.utc).timestamp()) + usage_sec
+            inbound_ids = per_panel.get(r["id"], {}).get("inbound_ids", [])
+            remote_names = []
+            for inb in inbound_ids:
+                rn = f"{app_username}_{secrets.token_hex(3)}"
+                client = {
+                    "id": str(uuid.uuid4()),
+                    "email": rn,
+                    "enable": True,
+                }
+                if limit_bytes > 0:
+                    client["totalGB"] = limit_bytes
+                if expire_ts > 0:
+                    client["expiryTime"] = expire_ts * 1000
+                payload = {
+                    "id": int(inb),
+                    "settings": json.dumps({"clients": [client]}, separators=(",", ":")),
+                }
+                obj, e = api.create_user(r["panel_url"], r["access_token"], payload)
+                if not obj:
+                    obj, g = api.get_user(r["panel_url"], r["access_token"], rn)
+                    if not obj:
+                        failed.append(f"{r['panel_url']} (inb {inb}): {e or g or 'unknown error'}")
+                        continue
+                if not obj.get("enabled", True):
+                    ok_en, err_en = api.enable_remote_user(r["panel_url"], r["access_token"], rn)
+                    if not ok_en:
+                        failed.append(f"{r['panel_url']} (inb {inb}): enable failed - {err_en or 'unknown'}")
+                        continue
+                remote_names.append(rn)
+            if remote_names:
+                remote_name = ",".join(remote_names)
+                save_link(owner_id, app_username, r["id"], remote_name)
+                ok += 1
+            continue
         else:
             expire_ts = 0 if usage_sec <= 0 else int(datetime.now(timezone.utc).timestamp()) + usage_sec
+            tmpl_info = per_panel.get(r["id"], {})
             payload = {
                 "username": app_username,
                 "expire": expire_ts,
                 "data_limit": limit_bytes,
                 "data_limit_reset_strategy": "no_reset",
                 "note": "created_by_bot",
-                "inbounds": {},
+                "proxies": clone_proxy_settings(tmpl_info.get("proxies", {})),
+                "inbounds": tmpl_info.get("inbounds", {}),
             }
         obj, e = api.create_user(r["panel_url"], r["access_token"], payload)
         if not obj:
-            obj, g = api.get_user(r["panel_url"], r["access_token"], app_username)
+            obj, g = api.get_user(r["panel_url"], r["access_token"], remote_name)
             if not obj:
                 failed.append(f"{r['panel_url']}: {e or g or 'unknown error'}")
                 continue
         if not obj.get("enabled", True):
-            ok_en, err_en = api.enable_remote_user(r["panel_url"], r["access_token"], app_username)
+            ok_en, err_en = api.enable_remote_user(r["panel_url"], r["access_token"], remote_name)
             if not ok_en:
                 failed.append(f"{r['panel_url']}: enable failed - {err_en or 'unknown'}")
-        save_link(owner_id, app_username, r["id"], app_username)
+        save_link(owner_id, app_username, r["id"], remote_name)
         ok += 1
 
     base = os.getenv("PUBLIC_BASE_URL", "http://localhost:5000").rstrip("/")
@@ -1646,7 +2085,8 @@ async def finalize_create_on_selected(q, context, owner_id: int, selected_ids: s
     await q.edit_message_text(txt)
 
 async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: set):
-    current = list_linked_panel_ids(owner_id, username)
+    links_map = map_linked_remote_usernames(owner_id, username)
+    current = set(links_map.keys())
     to_add = selected_ids - current
     to_remove = current - selected_ids
 
@@ -1658,19 +2098,19 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
     panels = list_panels_for_agent(owner_id) if not is_admin(owner_id) else list_my_panels_admin(owner_id)
     panels_map = {int(p["id"]): p for p in panels}
 
-    # NOTE: user may not exist (admin pressed panel edit without a valid local user)
     lu = get_local_user(owner_id, username)
     if lu:
         limit_bytes_default = int(lu["plan_limit_bytes"] or 0)
         exp = lu["expire_at"]
         usage_duration_default = max(86400, int((exp - datetime.utcnow()).total_seconds())) if exp else 3650*86400
     else:
-        # Safe defaults to avoid KeyError / NoneType when "activating a panel for admin (no user)"
         limit_bytes_default = 0
         usage_duration_default = 3650*86400
 
     if to_add:
-        expire_ts_default = 0 if usage_duration_default <= 0 else int(datetime.now(timezone.utc).timestamp()) + usage_duration_default
+        expire_ts_default = (
+            0 if usage_duration_default <= 0 else int(datetime.now(timezone.utc).timestamp()) + usage_duration_default
+        )
         for pid in to_add:
             p = panels_map.get(int(pid))
             if not p:
@@ -1686,6 +2126,7 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
                             if not ok_en:
                                 added_errs.append(f"{p['panel_url']}: enable failed - {err_en or 'unknown'}")
                         save_link(owner_id, username, int(pid), username)
+                        links_map[int(pid)] = username
                         added_ok += 1
                     else:
                         added_errs.append(f"{p['panel_url']}: no template & user not found")
@@ -1700,6 +2141,7 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
                             if not ok_en:
                                 added_errs.append(f"{p['panel_url']}: enable failed - {err_en or 'unknown'}")
                         save_link(owner_id, username, int(pid), username)
+                        links_map[int(pid)] = username
                         added_ok += 1
                     else:
                         added_errs.append(f"{p['panel_url']}: {e}")
@@ -1727,55 +2169,127 @@ async def apply_edit_user_panels(q, owner_id: int, username: str, selected_ids: 
                         added_errs.append(f"{p['panel_url']}: enable failed - {err_en or 'unknown'}")
 
                 save_link(owner_id, username, int(pid), username)
+                links_map[int(pid)] = username
                 added_ok += 1
-            else:
-                obj, g = api.get_user(p["panel_url"], p["access_token"], username)
-                if not obj:
+            elif p.get("panel_type") == "sanaei":
+                if not tmpl:
+                    added_errs.append(f"{p['panel_url']}: inbound missing")
+                    continue
+                inb_ids = [x.strip() for x in tmpl.split(",") if x.strip().isdigit()]
+                if not inb_ids:
+                    added_errs.append(f"{p['panel_url']}: inbound missing")
+                    continue
+                remote_names = []
+                for inb in inb_ids:
+                    remote_name = f"{username}_{secrets.token_hex(3)}"
+                    client = {
+                        "id": str(uuid.uuid4()),
+                        "email": remote_name,
+                        "enable": True,
+                    }
+                    if limit_bytes_default > 0:
+                        client["totalGB"] = limit_bytes_default
+                    if expire_ts_default > 0:
+                        client["expiryTime"] = expire_ts_default * 1000
                     payload = {
-                        "username": username,
-                        "expire": expire_ts_default,
-                        "data_limit": limit_bytes_default,
-                        "data_limit_reset_strategy": "no_reset",
-                        "note": "user_edit_add_panel",
-                        "inbounds": {},
+                        "id": int(inb),
+                        "settings": json.dumps({"clients": [client]}, separators=(",", ":")),
                     }
                     obj, e2 = api.create_user(p["panel_url"], p["access_token"], payload)
                     if not obj:
-                        added_errs.append(f"{p['panel_url']}: {e2 or 'unknown error'}")
+                        added_errs.append(f"{p['panel_url']} (inb {inb}): {e2 or 'unknown error'}")
+                        continue
+                    if not obj.get("enabled", True):
+                        ok_en, err_en = api.enable_remote_user(p["panel_url"], p["access_token"], remote_name)
+                        if not ok_en:
+                            added_errs.append(f"{p['panel_url']} (inb {inb}): enable failed - {err_en or 'unknown'}")
+                            continue
+                    remote_names.append(remote_name)
+                if remote_names:
+                    joined = ",".join(remote_names)
+                    save_link(owner_id, username, int(pid), joined)
+                    links_map[int(pid)] = joined
+                    added_ok += 1
+                continue
+            else:
+                obj, g = api.get_user(p["panel_url"], p["access_token"], username)
+                if not obj:
+                    if tmpl:
+                        tmpl_obj, t_err = api.get_user(
+                            p["panel_url"], p["access_token"], tmpl
+                        )
+                        if not tmpl_obj:
+                            added_errs.append(
+                                f"{p['panel_url']} (template '{tmpl}'): {t_err or 'not found'}"
+                            )
+                            continue
+                        payload = {
+                            "username": username,
+                            "expire": expire_ts_default,
+                            "data_limit": limit_bytes_default,
+                            "data_limit_reset_strategy": "no_reset",
+                            "note": "user_edit_add_panel",
+                            "proxies": clone_proxy_settings(tmpl_obj.get("proxies") or {}),
+                            "inbounds": tmpl_obj.get("inbounds") or {},
+                        }
+                        obj, e2 = api.create_user(
+                            p["panel_url"], p["access_token"], payload
+                        )
+                        if not obj:
+                            added_errs.append(
+                                f"{p['panel_url']}: {e2 or 'unknown error'}"
+                            )
+                            continue
+                    else:
+                        added_errs.append(
+                            f"{p['panel_url']}: no template & user not found"
+                        )
                         continue
                 if not obj.get("enabled", True):
-                    ok_en, err_en = api.enable_remote_user(p["panel_url"], p["access_token"], username)
+                    ok_en, err_en = api.enable_remote_user(
+                        p["panel_url"], p["access_token"], username
+                    )
                     if not ok_en:
-                        added_errs.append(f"{p['panel_url']}: enable failed - {err_en or 'unknown'}")
+                        added_errs.append(
+                            f"{p['panel_url']}: enable failed - {err_en or 'unknown'}"
+                        )
                 save_link(owner_id, username, int(pid), username)
+                links_map[int(pid)] = username
                 added_ok += 1
 
     if to_remove:
         for pid in to_remove:
             p = panels_map.get(int(pid))
+            remote = links_map.get(int(pid), username)
             remove_link(owner_id, username, int(pid))
+            links_map.pop(int(pid), None)
             removed += 1
             if p:
                 api = get_api(p.get("panel_type"))
-                ok, err = api.disable_remote_user(p["panel_url"], p["access_token"], username)
-                if not ok:
-                    added_errs.append(f"disable on {p['panel_url']}: {err or 'unknown error'}")
+                remotes = remote.split(",") if p.get("panel_type") == "sanaei" else [remote]
+                for rn in remotes:
+                    ok, err = api.disable_remote_user(p["panel_url"], p["access_token"], rn)
+                    if not ok:
+                        added_errs.append(f"disable on {p['panel_url']}: {err or 'unknown error'}")
 
     for pid in selected_ids:
         p = panels_map.get(int(pid))
         if not p:
             continue
         api = get_api(p.get("panel_type"))
-        obj, g = api.get_user(p["panel_url"], p["access_token"], username)
-        if obj:
-            if not obj.get("enabled", True):
-                ok_en, err_en = api.enable_remote_user(p["panel_url"], p["access_token"], username)
+        remote = links_map.get(int(pid), username)
+        remotes = remote.split(",") if p.get("panel_type") == "sanaei" else [remote]
+        for rn in remotes:
+            obj, g = api.get_user(p["panel_url"], p["access_token"], rn)
+            if obj and not obj.get("enabled", True):
+                ok_en, err_en = api.enable_remote_user(p["panel_url"], p["access_token"], rn)
                 if ok_en:
                     enabled_ok += 1
                 else:
                     added_errs.append(f"{p['panel_url']}: enable failed - {err_en or 'unknown'}")
-            if pid not in list_linked_panel_ids(owner_id, username):
-                save_link(owner_id, username, int(pid), username)
+        if int(pid) not in links_map:
+            save_link(owner_id, username, int(pid), remote)
+            links_map[int(pid)] = remote
 
     note = f"✅ اعمال شد. اضافه/ایجاد: {added_ok} | حذف مپ/دیسیبل: {removed} | فعال‌شده‌ها: {enabled_ok}"
     if added_errs:
@@ -1815,6 +2329,8 @@ def build_app():
             ASK_AGENT_TGID:        [MessageHandler(filters.TEXT & ~filters.COMMAND, got_agent_tgid)],
             ASK_AGENT_LIMIT:       [MessageHandler(filters.TEXT & ~filters.COMMAND, got_agent_limit)],
             ASK_AGENT_RENEW_DAYS:  [MessageHandler(filters.TEXT & ~filters.COMMAND, got_agent_renew_days)],
+            ASK_AGENT_MAX_USERS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_agent_user_limit)],
+            ASK_AGENT_MAX_USER_GB: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_agent_max_user_gb)],
 
             # user creation
             ASK_NEWUSER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_newuser_name)],
