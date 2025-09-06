@@ -5,12 +5,12 @@
 import logging
 from typing import Tuple
 
-from usage_sync import CurCtx, get_api, init_db, POOL
+from usage_sync import CurCtx, get_api, init_if_needed
 
 log = logging.getLogger("service_manager")
 
-if POOL is None:
-    init_db()
+# ensure database pool is initialized with environment settings
+init_if_needed()
 
 
 def switch_service_panel(service_id: int, new_panel_id: int) -> Tuple[bool, str]:
