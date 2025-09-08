@@ -211,7 +211,7 @@ fi
 [ -n "$(get_kv FLASK_PORT)" ] || set_kv "FLASK_PORT" "5000"
 [ -n "$(get_kv WORKERS)" ] || set_kv "WORKERS" "$((2 * $(nproc 2>/dev/null || echo 1) + 1))"
 [ -n "$(get_kv USAGE_SYNC_INTERVAL)" ] || set_kv "USAGE_SYNC_INTERVAL" "60"
-[ -n "$(get_kv IMAGE)" ] || set_kv "IMAGE" "ghcr.io/rh8831/valhalla:latest"
+[ -n "$(get_kv IMAGE)" ] || set_kv "IMAGE" "ghcr.io/rh8831/valhallabot:v1.0.0"
 
 # ---------- ask user ----------
 echo "---- Telegram ----"
