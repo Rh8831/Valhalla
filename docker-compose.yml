@@ -20,7 +20,7 @@ services:
 
   app:
     build: .
-    image: ${IMAGE:-ghcr.io/rh8831/valhalla:latest}
+    image: ${IMAGE:-ghcr.io/rh8831/valhallabot:v1.0.0}
     container_name: valhalla-app
     restart: unless-stopped
     depends_on:
@@ -48,7 +48,7 @@ services:
 
   bot:
     build: .
-    image: ${IMAGE:-ghcr.io/rh8831/valhalla:latest}
+    image: ${IMAGE:-ghcr.io/rh8831/valhallabot:v1.0.0}
     container_name: valhalla-bot
     restart: unless-stopped
     depends_on:
@@ -68,7 +68,7 @@ services:
 
   usage:
     build: .
-    image: ${IMAGE:-ghcr.io/rh8831/valhalla:latest}
+    image: ${IMAGE:-ghcr.io/rh8831/valhallabot:v1.0.0}
     container_name: valhalla-usage
     restart: unless-stopped
     depends_on:
