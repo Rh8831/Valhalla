@@ -20,7 +20,7 @@
 2. Run the setup script:
 
    ```sh
-   sudo bash -c "$(curl -sL https://raw.githubusercontent.com/Rh8831/Valhalla/refs/heads/main/setup.sh)"
+   sudo bash -c "$(curl -sL https://raw.githubusercontent.com/Rh8831/Valhallabot/refs/heads/main/setup.sh)"
    ```
 
    The script pulls pre-built container images and starts them without building,
