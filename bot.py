@@ -541,6 +541,17 @@ def get_preset(owner_id: int, preset_id: int):
         )
         return cur.fetchone()
 
+
+def update_preset(owner_id: int, preset_id: int, limit_bytes: int, duration_days: int):
+    with with_mysql_cursor(dict_=False) as cur:
+        ids = expand_owner_ids(owner_id)
+        placeholders = ",".join(["%s"] * len(ids))
+        params = [limit_bytes, duration_days, preset_id] + ids
+        cur.execute(
+            f"UPDATE account_presets SET limit_bytes=%s, duration_days=%s WHERE id=%s AND telegram_user_id IN ({placeholders})",
+            tuple(params),
+        )
+
 def upsert_app_user(tg_id: int, u: str) -> str:
     owner_ids = expand_owner_ids(tg_id)
     placeholders = ",".join(["%s"] * len(owner_ids))
@@ -1034,24 +1045,29 @@ def set_agent_panels(agent_tg_id: int, panel_ids: set[int]):
 # ---------- UI ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    is_sudo = is_admin(uid)
+    ag = get_agent(uid) if not is_sudo else None
+
+    if not is_sudo and not ag:
+        return
+
     header = ""
-    if not is_admin(uid):
-        ag = get_agent(uid)
-        if ag:
-            limit_b = int(ag.get("plan_limit_bytes") or 0)
-            max_users = int(ag.get("user_limit") or 0)
-            max_user_b = int(ag.get("max_user_bytes") or 0)
-            user_cnt = count_local_users(uid)
-            exp = ag.get("expire_at")
-            parts = [f"👤 <b>{ag['name']}</b>", f"👥 Users: {user_cnt}/{('∞' if max_users==0 else max_users)}"]
-            if limit_b:
-                parts.append(f"📦 Quota: {fmt_bytes_short(limit_b)}")
-            if max_user_b:
-                parts.append(f"📛 Max/User: {fmt_bytes_short(max_user_b)}")
-            if exp:
-                parts.append(f"⏳ Expire: {exp.strftime('%Y-%m-%d')}")
-            header = "\n".join(parts) + "\n\n"
-    if is_admin(uid):
+    if ag:
+        limit_b = int(ag.get("plan_limit_bytes") or 0)
+        max_users = int(ag.get("user_limit") or 0)
+        max_user_b = int(ag.get("max_user_bytes") or 0)
+        user_cnt = count_local_users(uid)
+        exp = ag.get("expire_at")
+        parts = [f"👤 <b>{ag['name']}</b>", f"👥 Users: {user_cnt}/{('∞' if max_users==0 else max_users)}"]
+        if limit_b:
+            parts.append(f"📦 Quota: {fmt_bytes_short(limit_b)}")
+        if max_user_b:
+            parts.append(f"📛 Max/User: {fmt_bytes_short(max_user_b)}")
+        if exp:
+            parts.append(f"⏳ Expire: {exp.strftime('%Y-%m-%d')}")
+        header = "\n".join(parts) + "\n\n"
+
+    if is_sudo:
         kb = [
             [InlineKeyboardButton("🧬 New Local User", callback_data="new_user")],
             [InlineKeyboardButton("🔍 Search User", callback_data="search_user")],
@@ -1066,6 +1082,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("👥 List Users", callback_data="list_users:0")],
             [InlineKeyboardButton("🧩 Presets", callback_data="manage_presets")],
         ]
+
     text = header + "Choose an option:"
     if update.message:
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
@@ -1140,10 +1157,16 @@ async def show_service_select(update_or_q, context, owner_id: int):
 
 async def show_preset_menu(q, context, uid: int, notice: str | None = None):
     rows = list_presets(uid)
-    kb = [[InlineKeyboardButton(f"{fmt_bytes_short(r['limit_bytes'])} / {r['duration_days']}d", callback_data=f"preset_del:{r['id']}")] for r in rows]
+    kb = []
+    for r in rows:
+        kb.append([
+            InlineKeyboardButton(f"{fmt_bytes_short(r['limit_bytes'])} / {r['duration_days']}d", callback_data=f"preset_edit:{r['id']}"),
+            InlineKeyboardButton("🗑️ حذف", callback_data=f"preset_del:{r['id']}")
+        ])
+
     kb.append([InlineKeyboardButton("➕ Add", callback_data="preset_add")])
     kb.append([InlineKeyboardButton("⬅️ Back", callback_data="back_home")])
-    text = "پریست‌ها:" if rows else "هیچ پریستی ثبت نشده."
+    text = "برای ویرایش پریست روی آن کلیک کنید یا برای حذف، دکمه حذف را بزنید.\n\nپریست‌ها:" if rows else "هیچ پریستی ثبت نشده."
     if notice: text = f"{notice}\n{text}"
     await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
@@ -1190,8 +1213,28 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "preset_add":
         await q.edit_message_text("حجم در GB پریست:")
         return ASK_PRESET_GB
+    if data.startswith("preset_edit:"):
+        pid = int(data.split(":", 1)[1])
+        context.user_data["editing_preset_id"] = pid
+        await q.edit_message_text("حجم جدید در GB پریست:")
+        return ASK_PRESET_GB
+
     if data.startswith("preset_del:"):
-        pid = int(data.split(":",1)[1])
+        pid = int(data.split(":", 1)[1])
+        preset = get_preset(uid, pid)
+        if not preset:
+            return await show_preset_menu(q, context, uid, notice="❌ پریست یافت نشد.")
+
+        text = f"پریست {fmt_bytes_short(preset['limit_bytes'])} / {preset['duration_days']}d حذف شود؟"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ بله، حذف کن", callback_data=f"preset_del_confirm:{pid}")],
+            [InlineKeyboardButton("⬅️ انصراف", callback_data="manage_presets")],
+        ])
+        await q.edit_message_text(text, reply_markup=kb)
+        return ConversationHandler.END
+
+    if data.startswith("preset_del_confirm:"):
+        pid = int(data.split(":", 1)[1])
         delete_preset(uid, pid)
         return await show_preset_menu(q, context, uid, notice="✅ حذف شد.")
     if data.startswith("preset_sel:"):
@@ -2012,11 +2055,19 @@ async def got_preset_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ یک عدد مثبت بفرست:")
         return ASK_PRESET_DAYS
     limit_b = int(context.user_data.get("preset_limit_bytes") or 0)
-    create_preset(update.effective_user.id, limit_b, days)
+
+    editing_id = context.user_data.pop("editing_preset_id", None)
+    if editing_id:
+        update_preset(update.effective_user.id, editing_id, limit_b, days)
+        notice = "✅ پریست ویرایش شد."
+    else:
+        create_preset(update.effective_user.id, limit_b, days)
+        notice = "✅ پریست ذخیره شد."
+
     class Fake:
         async def edit_message_text(self, *a, **k):
             await update.message.reply_text(*a, **k)
-    return await show_preset_menu(Fake(), context, update.effective_user.id, notice="✅ پریست ذخیره شد.")
+    return await show_preset_menu(Fake(), context, update.effective_user.id, notice=notice)
 
 # ---------- add/edit panels (admin only) ----------
 async def got_panel_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2348,6 +2399,13 @@ async def got_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ یک عدد مثبت بفرست (مثلا 30).")
         return ASK_DURATION
     context.user_data["duration_days"] = days
+
+    uid = update.effective_user.id
+    panels = list_panels_for_agent(uid) if not is_admin(uid) else list_my_panels_admin(uid)
+    if not panels:
+        await update.message.reply_text("❌ هیچ پنلی برای شما ثبت نشده. لطفا به ادمین اطلاع دهید.")
+        return ConversationHandler.END
+
     class FakeMsg:
         async def edit_message_text(self, *args, **kwargs):
             await update.message.reply_text(*args, **kwargs)
