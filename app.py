@@ -12,7 +12,7 @@ Flask subscription aggregator for Marzneshin/Marzban panels
 import os
 import logging
 import re
-from urllib.parse import urljoin, unquote
+from urllib.parse import urljoin, unquote, quote
 
 import base64
 import requests
@@ -608,7 +608,20 @@ def unified_links(local_username, app_key):
                     log.warning("disable on %s@%s -> %s %s", l["remote_username"], l["panel_url"], code, msg)
             mark_user_disabled(owner_id, local_username)
         if not want_html:
-            resp = Response("", mimetype="text/plain")
+            limit_config = os.getenv("USER_LIMIT_REACHED_CONFIG")
+            if limit_config:
+                msg_template = os.getenv(
+                    "USER_LIMIT_REACHED_MESSAGE",
+                    "User {username} has reached data limit ({used} / {limit})",
+                )
+                msg = msg_template.replace("{username}", local_username)
+                msg = msg.replace("{limit}", bytesformat(limit))
+                msg = msg.replace("{used}", bytesformat(used))
+                body = limit_config + "#" + quote(msg)
+                resp = Response(body, mimetype="text/plain")
+            else:
+                resp = Response("", mimetype="text/plain")
+
             resp.headers["X-Plan-Limit-Bytes"] = str(limit)
             resp.headers["X-Used-Bytes"] = str(used)
             resp.headers["X-Remaining-Bytes"] = "0"
