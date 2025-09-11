@@ -346,6 +346,37 @@ def ensure_schema():
                 UNIQUE KEY uq_owner_preset(telegram_user_id, limit_bytes, duration_days)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS settings(
+                owner_id BIGINT NOT NULL,
+                `key` VARCHAR(64) NOT NULL,
+                `value` VARCHAR(4096) NOT NULL,
+                PRIMARY KEY (owner_id, `key`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+
+def get_setting(owner_id: int, key: str):
+    oid = canonical_owner_id(owner_id)
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            "SELECT value FROM settings WHERE owner_id=%s AND `key`=%s",
+            (oid, key),
+        )
+        row = cur.fetchone()
+        return row["value"] if row else None
+
+
+def set_setting(owner_id: int, key: str, value: str):
+    oid = canonical_owner_id(owner_id)
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO settings (owner_id, `key`, `value`)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)
+            """,
+            (oid, key, value),
+        )
 
 # ---------- helpers ----------
 UNIT = 1024
@@ -2824,6 +2855,24 @@ async def sync_user_panels_async(owner_id: int, username: str, selected_ids: set
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, sync_user_panels, owner_id, username, selected_ids)
 
+
+# ---------- admin commands ----------
+async def cmd_set_limit_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    text = update.message.text or ""
+    parts = text.split(" ", 1)
+    if len(parts) == 1:
+        cur = get_setting(update.effective_user.id, "limit_message")
+        if cur:
+            await update.message.reply_text(f"Current message:\n{cur}")
+        else:
+            await update.message.reply_text("No limit message set.")
+        return
+    msg = parts[1]
+    set_setting(update.effective_user.id, "limit_message", msg)
+    await update.message.reply_text("Limit message updated.")
+
 # ---------- wiring ----------
 def build_app():
     load_dotenv()
@@ -2833,6 +2882,7 @@ def build_app():
     init_mysql_pool()
     ensure_schema()
     app = Application.builder().token(tok).build()
+    app.add_handler(CommandHandler("setlimitmsg", cmd_set_limit_msg))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start), CallbackQueryHandler(on_button)],
