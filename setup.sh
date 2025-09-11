@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_DIR="/app"
 ENV_FILE="$APP_DIR/.env"
-COMPOSE_URL="https://raw.githubusercontent.com/RH8888/Valhallabot/refs/heads/main/docker-compose.yml"
+COMPOSE_URL="https://raw.githubusercontent.com/rh8888/Valhallabot/refs/heads/main/docker-compose.yml"
 COMPOSE_FILE="$APP_DIR/docker-compose.yml"
 
 mkdir -p "$APP_DIR"
@@ -211,7 +211,7 @@ fi
 [ -n "$(get_kv FLASK_PORT)" ] || set_kv "FLASK_PORT" "5000"
 [ -n "$(get_kv WORKERS)" ] || set_kv "WORKERS" "$((2 * $(nproc 2>/dev/null || echo 1) + 1))"
 [ -n "$(get_kv USAGE_SYNC_INTERVAL)" ] || set_kv "USAGE_SYNC_INTERVAL" "60"
-[ -n "$(get_kv IMAGE)" ] || set_kv "IMAGE" "ghcr.io/RH8888/valhallabot:v1.0.0"
+[ -n "$(get_kv IMAGE)" ] || set_kv "IMAGE" "ghcr.io/rh8888/valhallabot:v1.0.0"
 
 # ---------- ask user ----------
 echo "---- Telegram ----"
