@@ -139,7 +139,10 @@ def canonical_owner_id(owner_id: int) -> int:
 
     # preset mgmt
     ASK_PRESET_GB, ASK_PRESET_DAYS,
-) = range(31)
+
+    # settings
+    ASK_LIMIT_MSG,
+) = range(32)
 
 # ---------- MySQL ----------
 MYSQL_POOL = None
@@ -346,6 +349,37 @@ def ensure_schema():
                 UNIQUE KEY uq_owner_preset(telegram_user_id, limit_bytes, duration_days)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS settings(
+                owner_id BIGINT NOT NULL,
+                `key` VARCHAR(64) NOT NULL,
+                `value` VARCHAR(4096) NOT NULL,
+                PRIMARY KEY (owner_id, `key`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+
+def get_setting(owner_id: int, key: str):
+    oid = canonical_owner_id(owner_id)
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            "SELECT value FROM settings WHERE owner_id=%s AND `key`=%s",
+            (oid, key),
+        )
+        row = cur.fetchone()
+        return row["value"] if row else None
+
+
+def set_setting(owner_id: int, key: str, value: str):
+    oid = canonical_owner_id(owner_id)
+    with with_mysql_cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO settings (owner_id, `key`, `value`)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)
+            """,
+            (oid, key, value),
+        )
 
 # ---------- helpers ----------
 UNIT = 1024
@@ -1202,10 +1236,19 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🆕 Add Service", callback_data="add_service")],
             [InlineKeyboardButton("🧰 Manage Services", callback_data="manage_services")],
             [InlineKeyboardButton("👑 Manage Agents", callback_data="manage_agents")],
+            [InlineKeyboardButton("💬 Limit Message", callback_data="limit_msg")],
             [InlineKeyboardButton("⬅️ Back", callback_data="back_home")],
         ]
         await q.edit_message_text("پنل ادمین:", reply_markup=InlineKeyboardMarkup(kb))
         return ConversationHandler.END
+
+    if data == "limit_msg":
+        if not is_admin(uid):
+            await q.edit_message_text("دسترسی ندارید.")
+            return ConversationHandler.END
+        cur = get_setting(uid, "limit_message") or "—"
+        await q.edit_message_text(f"پیام فعلی:\n{cur}\n\nپیام جدید را بفرست:")
+        return ASK_LIMIT_MSG
 
     # --- admin/agent shared
     if data == "manage_presets":
@@ -2069,6 +2112,18 @@ async def got_preset_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(*a, **k)
     return await show_preset_menu(Fake(), context, update.effective_user.id, notice=notice)
 
+# ---------- settings (admin) ----------
+async def got_limit_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    msg = (update.message.text or "").strip()
+    if not msg:
+        await update.message.reply_text("❌ پیام خالیه. دوباره بفرست:")
+        return ASK_LIMIT_MSG
+    set_setting(update.effective_user.id, "limit_message", msg)
+    await update.message.reply_text("✅ پیام ذخیره شد.")
+    return ConversationHandler.END
+
 # ---------- add/edit panels (admin only) ----------
 async def got_panel_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -2864,6 +2919,9 @@ def build_app():
             ASK_SERVICE_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, got_service_name)],
             ASK_EDIT_SERVICE_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND, got_service_new_name)],
             ASK_ASSIGN_SERVICE_PANELS: [CallbackQueryHandler(on_button)],
+
+            # settings
+            ASK_LIMIT_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_limit_msg)],
 
             # preset mgmt
             ASK_PRESET_GB:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_preset_gb)],
