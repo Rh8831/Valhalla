@@ -142,7 +142,8 @@ def canonical_owner_id(owner_id: int) -> int:
 
     # settings
     ASK_LIMIT_MSG,
-) = range(32)
+    ASK_EMERGENCY_CFG,
+) = range(33)
 
 # ---------- MySQL ----------
 MYSQL_POOL = None
@@ -1237,6 +1238,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🧰 Manage Services", callback_data="manage_services")],
             [InlineKeyboardButton("👑 Manage Agents", callback_data="manage_agents")],
             [InlineKeyboardButton("💬 Limit Message", callback_data="limit_msg")],
+            [InlineKeyboardButton("🚨 Emergency Config", callback_data="emerg_cfg")],
             [InlineKeyboardButton("⬅️ Back", callback_data="back_home")],
         ]
         await q.edit_message_text("پنل ادمین:", reply_markup=InlineKeyboardMarkup(kb))
@@ -1249,6 +1251,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur = get_setting(uid, "limit_message") or "—"
         await q.edit_message_text(f"پیام فعلی:\n{cur}\n\nپیام جدید را بفرست:")
         return ASK_LIMIT_MSG
+
+    if data == "emerg_cfg":
+        if not is_admin(uid):
+            await q.edit_message_text("دسترسی ندارید.")
+            return ConversationHandler.END
+        cur = get_setting(uid, "emergency_config") or "—"
+        await q.edit_message_text(
+            f"کانفیگ فعلی:\n{cur}\n\nکانفیگ جدید را بفرست (یا off برای پاک کردن):"
+        )
+        return ASK_EMERGENCY_CFG
 
     # --- admin/agent shared
     if data == "manage_presets":
@@ -2124,6 +2136,21 @@ async def got_limit_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ پیام ذخیره شد.")
     return ConversationHandler.END
 
+async def got_emerg_cfg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    msg = (update.message.text or "").strip()
+    if msg.lower() in {"off", "none", "clear"}:
+        set_setting(update.effective_user.id, "emergency_config", "")
+        await update.message.reply_text("✅ کانفیگ پاک شد.")
+        return ConversationHandler.END
+    if not msg:
+        await update.message.reply_text("❌ کانفیگ خالیه. دوباره بفرست:")
+        return ASK_EMERGENCY_CFG
+    set_setting(update.effective_user.id, "emergency_config", msg)
+    await update.message.reply_text("✅ کانفیگ ذخیره شد.")
+    return ConversationHandler.END
+
 # ---------- add/edit panels (admin only) ----------
 async def got_panel_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -2922,6 +2949,7 @@ def build_app():
 
             # settings
             ASK_LIMIT_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_limit_msg)],
+            ASK_EMERGENCY_CFG: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_emerg_cfg)],
 
             # preset mgmt
             ASK_PRESET_GB:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_preset_gb)],
