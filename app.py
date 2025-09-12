@@ -664,6 +664,10 @@ def unified_links(local_username, app_key):
             all_links, errors, remote_info = collect_links(mappings, local_username, want_html)
 
     uniq = filter_dedupe(all_links)
+    emerg = get_setting(owner_id, "emergency_config")
+    if emerg:
+        uniq.append(emerg.strip())
+        uniq = filter_dedupe(uniq)
     if uniq:
         body = "\n".join(uniq) + "\n"
     elif errors:
