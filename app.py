@@ -12,7 +12,7 @@ Flask subscription aggregator for Marzneshin/Marzban panels
 import os
 import logging
 import re
-from urllib.parse import urljoin, unquote
+from urllib.parse import urljoin, unquote, quote
 
 import base64
 import requests
@@ -101,6 +101,21 @@ def expand_owner_ids(owner_id: int) -> list[int]:
     ids = admin_ids()
     return list(ids) if owner_id in ids else [owner_id]
 
+def canonical_owner_id(owner_id: int) -> int:
+    ids = expand_owner_ids(owner_id)
+    return ids[0]
+
+
+def get_setting(owner_id: int, key: str):
+    oid = canonical_owner_id(owner_id)
+    with CurCtx() as cur:
+        cur.execute(
+            "SELECT value FROM settings WHERE owner_id=%s AND `key`=%s LIMIT 1",
+            (oid, key),
+        )
+        row = cur.fetchone()
+        return row["value"] if row else None
+
 # ---------- queries ----------
 def get_owner_id(app_username, app_key):
     with CurCtx() as cur:
@@ -117,7 +132,7 @@ def get_local_user(owner_id, local_username):
     with CurCtx() as cur:
         cur.execute(
             f"""
-            SELECT owner_id, username, plan_limit_bytes, used_bytes, expire_at, disabled_pushed
+            SELECT owner_id, username, plan_limit_bytes, used_bytes, expire_at, disabled_pushed, service_id
             FROM local_users
             WHERE owner_id IN ({placeholders}) AND username=%s
             LIMIT 1
@@ -608,7 +623,20 @@ def unified_links(local_username, app_key):
                     log.warning("disable on %s@%s -> %s %s", l["remote_username"], l["panel_url"], code, msg)
             mark_user_disabled(owner_id, local_username)
         if not want_html:
-            resp = Response("", mimetype="text/plain")
+            limit_config = os.getenv(
+                "USER_LIMIT_REACHED_CONFIG",
+                "vless://limitreached@info.info:80?encryption=none&security=none&type=tcp&headerType=none",
+            )
+            msg_template = get_setting(owner_id, "limit_message") or os.getenv(
+                "USER_LIMIT_REACHED_MESSAGE",
+                "User {username} has reached data limit ({used} / {limit})",
+            )
+            msg = msg_template.replace("{username}", local_username)
+            msg = msg.replace("{limit}", bytesformat(limit))
+            msg = msg.replace("{used}", bytesformat(used))
+            body = limit_config + "#" + quote(msg)
+            resp = Response(body, mimetype="text/plain")
+
             resp.headers["X-Plan-Limit-Bytes"] = str(limit)
             resp.headers["X-Used-Bytes"] = str(used)
             resp.headers["X-Remaining-Bytes"] = "0"
@@ -636,6 +664,15 @@ def unified_links(local_username, app_key):
             all_links, errors, remote_info = collect_links(mappings, local_username, want_html)
 
     uniq = filter_dedupe(all_links)
+    sid = lu.get("service_id") if lu else None
+    emerg = None
+    if sid:
+        emerg = get_setting(owner_id, f"emergency_config_service_{sid}")
+    if not emerg:
+        emerg = get_setting(owner_id, "emergency_config")
+    if emerg:
+        uniq.append(emerg.strip())
+        uniq = filter_dedupe(uniq)
     if uniq:
         body = "\n".join(uniq) + "\n"
     elif errors:
