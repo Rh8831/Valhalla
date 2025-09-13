@@ -143,7 +143,8 @@ def canonical_owner_id(owner_id: int) -> int:
     # settings
     ASK_LIMIT_MSG,
     ASK_EMERGENCY_CFG,
-) = range(33)
+    ASK_SERVICE_EMERGENCY_CFG,
+) = range(34)
 
 # ---------- MySQL ----------
 MYSQL_POOL = None
@@ -1366,6 +1367,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sid = context.user_data.get("service_id")
         return await show_service_panel_select(q, context, sid)
 
+    if data == "service_emerg_cfg":
+        if not is_admin(uid):
+            return ConversationHandler.END
+        sid = context.user_data.get("service_id")
+        cur = get_setting(uid, f"emergency_config_service_{sid}") or "—"
+        await q.edit_message_text(
+            f"کانفیگ فعلی:\n{cur}\n\nکانفیگ جدید را بفرست (یا off برای پاک کردن):"
+        )
+        return ASK_SERVICE_EMERGENCY_CFG
+
     if data == "service_rename":
         if not is_admin(uid):
             return ConversationHandler.END
@@ -1975,6 +1986,7 @@ async def show_service_card(q, context: ContextTypes.DEFAULT_TYPE, service_id: i
     lines.append("\nچه کاری انجام بدهم؟")
     kb = [
         [InlineKeyboardButton("🧷 Assign Panels", callback_data="service_assign_panels")],
+        [InlineKeyboardButton("🚨 Emergency Config", callback_data="service_emerg_cfg")],
         [InlineKeyboardButton("✏️ Rename Service", callback_data="service_rename")],
         [InlineKeyboardButton("🗑️ Remove Service", callback_data="service_delete")],
         [InlineKeyboardButton("⬅️ Back", callback_data="manage_services")],
@@ -2149,6 +2161,23 @@ async def got_emerg_cfg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASK_EMERGENCY_CFG
     set_setting(update.effective_user.id, "emergency_config", msg)
     await update.message.reply_text("✅ کانفیگ ذخیره شد.")
+    return ConversationHandler.END
+
+async def got_service_emerg_cfg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    sid = context.user_data.get("service_id")
+    msg = (update.message.text or "").strip()
+    key = f"emergency_config_service_{sid}"
+    if msg.lower() in {"off", "none", "clear"}:
+        set_setting(update.effective_user.id, key, "")
+        await update.message.reply_text("✅ کانفیگ سرویس پاک شد.")
+        return ConversationHandler.END
+    if not msg:
+        await update.message.reply_text("❌ کانفیگ خالیه. دوباره بفرست:")
+        return ASK_SERVICE_EMERGENCY_CFG
+    set_setting(update.effective_user.id, key, msg)
+    await update.message.reply_text("✅ کانفیگ سرویس ذخیره شد.")
     return ConversationHandler.END
 
 # ---------- add/edit panels (admin only) ----------
@@ -2950,6 +2979,7 @@ def build_app():
             # settings
             ASK_LIMIT_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_limit_msg)],
             ASK_EMERGENCY_CFG: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_emerg_cfg)],
+            ASK_SERVICE_EMERGENCY_CFG: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_service_emerg_cfg)],
 
             # preset mgmt
             ASK_PRESET_GB:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_preset_gb)],

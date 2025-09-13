@@ -132,7 +132,7 @@ def get_local_user(owner_id, local_username):
     with CurCtx() as cur:
         cur.execute(
             f"""
-            SELECT owner_id, username, plan_limit_bytes, used_bytes, expire_at, disabled_pushed
+            SELECT owner_id, username, plan_limit_bytes, used_bytes, expire_at, disabled_pushed, service_id
             FROM local_users
             WHERE owner_id IN ({placeholders}) AND username=%s
             LIMIT 1
@@ -664,7 +664,12 @@ def unified_links(local_username, app_key):
             all_links, errors, remote_info = collect_links(mappings, local_username, want_html)
 
     uniq = filter_dedupe(all_links)
-    emerg = get_setting(owner_id, "emergency_config")
+    sid = lu.get("service_id") if lu else None
+    emerg = None
+    if sid:
+        emerg = get_setting(owner_id, f"emergency_config_service_{sid}")
+    if not emerg:
+        emerg = get_setting(owner_id, "emergency_config")
     if emerg:
         uniq.append(emerg.strip())
         uniq = filter_dedupe(uniq)
